@@ -12,36 +12,35 @@ using WordPressPCL.Models;
 var html = new HtmlDocument();
 
 // Source: WordPress
-var oldWP = new WordPressClient("https://holographica.space/wp-json");
-
+var wp = new WordPressClient("https://holographica.space/wp-json/");
 // Target: Ghost at new.holographica.space
 const string ghostUrl = "https://new.holographica.space";
-const string ghostAdminApiKey = "YOUR_ADMIN_API_KEY"; // Format: {id}:{secret} - Get from Ghost Admin > Settings > Integrations
+const string ghostAdminApiKey = "69288e148eb69d0351ab7933:0f24e27f99e1af24e71a4817d8783636f9b808301cb99896c640a435ec0a03c4"; // Format: {id}:{secret} - Get from Ghost Admin > Settings > Integrations
 
 // Ghost API client setup
 var ghostClient = new GhostAdminClient(ghostUrl, ghostAdminApiKey);
 
-List<Post>? oldPosts = null;
-List<Tag>? oldTags = null;
-List<User>? oldUsers = null;
-List<Category>? oldCategories = null;
+List<Post>? wpPosts = null;
+List<Tag>? wpTags = null;
+List<User>? wpUsers = null;
+List<Category>? wpCategories = null;
 List<GhostPost>? ghostPosts = null;
 List<GhostTag>? ghostTags = null;
 
-var oldTagsDict = new Dictionary<int, string>();
-var oldUsersDict = new Dictionary<int, string>();
+var wpTagsDict = new Dictionary<int, string>();
+var wpUsersDict = new Dictionary<int, string>();
 var ghostTagsDict = new Dictionary<string, string>(); // slug -> ghost id
 
-// await LoadLocalData();
-await DownloadAndSaveAllData();
+await LoadLocalData();
+// await DownloadAndSaveAllData();
 await ProcessPosts();
 
 async Task LoadLocalData()
 {
-    oldPosts = JsonConvert.DeserializeObject<List<Post>>(await File.ReadAllTextAsync("oldPosts.txt"));
-    oldTags = JsonConvert.DeserializeObject<List<Tag>>(await File.ReadAllTextAsync("oldTags.txt"));
-    oldUsers = JsonConvert.DeserializeObject<List<User>>(await File.ReadAllTextAsync("oldUsers.txt"));
-    oldCategories = JsonConvert.DeserializeObject<List<Category>>(await File.ReadAllTextAsync("oldCategories.txt"));
+    wpPosts = JsonConvert.DeserializeObject<List<Post>>(await File.ReadAllTextAsync("wpPosts.txt"));
+    wpTags = JsonConvert.DeserializeObject<List<Tag>>(await File.ReadAllTextAsync("wpTags.txt"));
+    wpUsers = JsonConvert.DeserializeObject<List<User>>(await File.ReadAllTextAsync("wpUsers.txt"));
+    wpCategories = JsonConvert.DeserializeObject<List<Category>>(await File.ReadAllTextAsync("wpCategories.txt"));
     ghostPosts = JsonConvert.DeserializeObject<List<GhostPost>>(await File.ReadAllTextAsync("ghostPosts.txt"));
     ghostTags = JsonConvert.DeserializeObject<List<GhostTag>>(await File.ReadAllTextAsync("ghostTags.txt"));
 }
@@ -49,52 +48,53 @@ async Task LoadLocalData()
 async Task DownloadAndSaveAllData()
 {
     Console.WriteLine("Downloading WordPress data...");
-    oldPosts = (await oldWP.Posts.GetAllAsync()).ToList();
-    oldUsers = (await oldWP.Users.GetAllAsync()).ToList();
-    oldTags = (await oldWP.Tags.GetAllAsync()).ToList();
-    oldCategories = (await oldWP.Categories.GetAllAsync()).ToList();
+    wpPosts = (await wp.Posts.GetAllAsync()).ToList();
+    Console.WriteLine($"Downloaded {wpPosts.Count} WP posts");
+    wpUsers = (await wp.Users.GetAllAsync()).ToList();
+    wpTags = (await wp.Tags.GetAllAsync()).ToList();
+    wpCategories = (await wp.Categories.GetAllAsync()).ToList();
 
     Console.WriteLine("Downloading Ghost data...");
     ghostPosts = await ghostClient.GetAllPostsAsync();
     ghostTags = await ghostClient.GetAllTagsAsync();
 
-    await File.WriteAllTextAsync("oldUsers.txt", JsonConvert.SerializeObject(oldUsers));
-    await File.WriteAllTextAsync("oldTags.txt", JsonConvert.SerializeObject(oldTags));
-    await File.WriteAllTextAsync("oldPosts.txt", JsonConvert.SerializeObject(oldPosts));
-    await File.WriteAllTextAsync("oldCategories.txt", JsonConvert.SerializeObject(oldCategories));
+    await File.WriteAllTextAsync("wpUsers.txt", JsonConvert.SerializeObject(wpUsers));
+    await File.WriteAllTextAsync("wpTags.txt", JsonConvert.SerializeObject(wpTags));
+    await File.WriteAllTextAsync("wpPosts.txt", JsonConvert.SerializeObject(wpPosts));
+    await File.WriteAllTextAsync("wpCategories.txt", JsonConvert.SerializeObject(wpCategories));
     await File.WriteAllTextAsync("ghostPosts.txt", JsonConvert.SerializeObject(ghostPosts));
     await File.WriteAllTextAsync("ghostTags.txt", JsonConvert.SerializeObject(ghostTags));
 
-    Console.WriteLine($"Downloaded {oldPosts.Count} WP posts, {ghostPosts.Count} Ghost posts");
+    Console.WriteLine($"Downloaded {wpPosts.Count} WP posts, {ghostPosts.Count} Ghost posts");
 }
 
 async Task ProcessPosts()
 {
     // Build lookup dictionaries
-    if (oldTags != null)
-        foreach (var tag in oldTags)
-            oldTagsDict[tag.Id] = tag.Slug;
+    if (wpTags != null)
+        foreach (var tag in wpTags)
+            wpTagsDict[tag.Id] = tag.Slug;
 
-    if (oldUsers != null)
-        foreach (var user in oldUsers)
-            oldUsersDict[user.Id] = user.Slug;
+    if (wpUsers != null)
+        foreach (var user in wpUsers)
+            wpUsersDict[user.Id] = user.Slug;
 
     if (ghostTags != null)
         foreach (var tag in ghostTags)
             ghostTagsDict[tag.Slug] = tag.Id;
 
-    if (oldPosts == null) return;
+    if (wpPosts == null) return;
 
-    var total = oldPosts.Count;
+    var total = wpPosts.Count;
     var processed = 0;
 
-    foreach (var oldPost in oldPosts)
+    foreach (var wpPost in wpPosts)
     {
         processed++;
         var progress = (processed / (decimal)total * 100).ToString("F2");
         Console.Write($"Progress {progress}% ");
 
-        var targetSlug = $"{oldPost.Slug}-{oldPost.Id}";
+        var targetSlug = $"{wpPost.Slug}-{wpPost.Id}";
 
         if (ghostPosts?.Any(p => p.Slug == targetSlug) == true)
         {
@@ -102,7 +102,7 @@ async Task ProcessPosts()
             continue;
         }
 
-        await MovePostToGhost(oldPost, targetSlug);
+        await MovePostToGhost(wpPost, targetSlug);
     }
 }
 
@@ -114,9 +114,9 @@ async Task MovePostToGhost(Post wpPost, string targetSlug)
     var postTags = new List<GhostTag>();
     foreach (var tagId in wpPost.Tags)
     {
-        if (!oldTagsDict.TryGetValue(tagId, out var slug)) continue;
+        if (!wpTagsDict.TryGetValue(tagId, out var slug)) continue;
 
-        var tagName = oldTags?.FirstOrDefault(t => t.Id == tagId)?.Name ?? slug;
+        var tagName = wpTags?.FirstOrDefault(t => t.Id == tagId)?.Name ?? slug;
 
         if (ghostTagsDict.TryGetValue(slug, out var ghostTagId))
         {
@@ -134,7 +134,7 @@ async Task MovePostToGhost(Post wpPost, string targetSlug)
     }
 
     // Also convert categories to tags (Ghost doesn't have categories)
-    foreach (var category in wpPost.Categories.Select(catId => oldCategories?.FirstOrDefault(c => c.Id == catId)).Where(category => category != null))
+    foreach (var category in wpPost.Categories.Select(catId => wpCategories?.FirstOrDefault(c => c.Id == catId)).Where(category => category != null))
     {
         if (ghostTagsDict.TryGetValue(category!.Slug, out var ghostTagId))
         {
@@ -215,25 +215,22 @@ public class GhostAdminClient
     private string GenerateToken()
     {
         var now = DateTime.UtcNow;
-        var handler = new JwtSecurityTokenHandler();
+        var key = new SymmetricSecurityKey(_keySecret) { KeyId = _keyId };
+        var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 
-        var descriptor = new SecurityTokenDescriptor
-        {
-            Audience = "/admin/",
-            IssuedAt = now,
-            Expires = now.AddMinutes(5),
-            SigningCredentials = new SigningCredentials(
-                new SymmetricSecurityKey(_keySecret),
-                SecurityAlgorithms.HmacSha256Signature),
-            AdditionalHeaderClaims = new Dictionary<string, object>
-            {
-                { "kid", _keyId },
-                { "typ", "JWT" }
-            }
-        };
+        var header = new JwtHeader(credentials);
+        header["kid"] = _keyId;
 
-        var token = handler.CreateToken(descriptor);
-        return handler.WriteToken(token);
+        var payload = new JwtPayload(
+            issuer: null,
+            audience: "/admin/",
+            claims: null,
+            notBefore: null,
+            expires: now.AddMinutes(5),
+            issuedAt: now);
+
+        var token = new JwtSecurityToken(header, payload);
+        return new JwtSecurityTokenHandler().WriteToken(token);
     }
 
     private HttpRequestMessage CreateRequest(HttpMethod method, string endpoint)
@@ -311,14 +308,19 @@ public class GhostAdminClient
     {
         var request = CreateRequest(HttpMethod.Post, "posts/?source=html");
 
+        // Truncate excerpt to 300 chars max
+        var excerpt = post.CustomExcerpt;
+        if (excerpt?.Length > 300)
+            excerpt = excerpt[..297] + "...";
+
         var postData = new Dictionary<string, object?>
         {
             ["title"] = post.Title,
             ["slug"] = post.Slug,
             ["html"] = post.Html,
             ["status"] = post.Status,
-            ["custom_excerpt"] = post.CustomExcerpt,
-            ["published_at"] = post.PublishedAt?.ToString("o"),
+            ["custom_excerpt"] = excerpt,
+            ["published_at"] = post.PublishedAt?.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
             ["feature_image"] = post.FeatureImage,
             ["tags"] = post.Tags?.Select(t => new { id = t.Id, slug = t.Slug, name = t.Name }).ToArray()
         };
