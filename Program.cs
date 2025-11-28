@@ -33,7 +33,9 @@ var ghostTagsDict = new Dictionary<string, string>(); // slug -> ghost id
 
 await LoadLocalData();
 // await DownloadAndSaveAllData();
-await ProcessPosts();
+// await ProcessPosts();
+// await ProcessFivePosts();
+await GenerateRedirects();
 
 async Task LoadLocalData()
 {
@@ -70,19 +72,7 @@ async Task DownloadAndSaveAllData()
 
 async Task ProcessPosts()
 {
-    // Build lookup dictionaries
-    if (wpTags != null)
-        foreach (var tag in wpTags)
-            wpTagsDict[tag.Id] = tag.Slug;
-
-    if (wpUsers != null)
-        foreach (var user in wpUsers)
-            wpUsersDict[user.Id] = user.Slug;
-
-    if (ghostTags != null)
-        foreach (var tag in ghostTags)
-            ghostTagsDict[tag.Slug] = tag.Id;
-
+    BuildLookupDictionaries();
     if (wpPosts == null) return;
 
     var total = wpPosts.Count;
@@ -94,7 +84,7 @@ async Task ProcessPosts()
         var progress = (processed / (decimal)total * 100).ToString("F2");
         Console.Write($"Progress {progress}% ");
 
-        var targetSlug = $"{wpPost.Slug}-{wpPost.Id}";
+        var targetSlug = wpPost.Slug;
 
         if (ghostPosts?.Any(p => p.Slug == targetSlug) == true)
         {
@@ -104,6 +94,67 @@ async Task ProcessPosts()
 
         await MovePostToGhost(wpPost, targetSlug);
     }
+}
+
+async Task ProcessFivePosts()
+{
+    BuildLookupDictionaries();
+    if (wpPosts == null) return;
+
+    var postsToProcess = wpPosts
+        .Where(p => ghostPosts?.Any(g => g.Slug == p.Slug) != true)
+        .Take(5)
+        .ToList();
+
+    Console.WriteLine($"Processing {postsToProcess.Count} posts...");
+
+    foreach (var wpPost in postsToProcess)
+    {
+        await MovePostToGhost(wpPost, wpPost.Slug);
+    }
+}
+
+void BuildLookupDictionaries()
+{
+    if (wpTags != null)
+        foreach (var tag in wpTags)
+            wpTagsDict[tag.Id] = tag.Slug;
+
+    if (wpUsers != null)
+        foreach (var user in wpUsers)
+            wpUsersDict[user.Id] = user.Slug;
+
+    if (ghostTags != null)
+        foreach (var tag in ghostTags)
+            ghostTagsDict[tag.Slug] = tag.Id;
+}
+
+async Task GenerateRedirects()
+{
+    BuildLookupDictionaries();
+    if (wpPosts == null || wpCategories == null) return;
+
+    var redirects = new List<object>();
+
+    foreach (var post in wpPosts)
+    {
+        var categoryId = post.Categories.FirstOrDefault();
+        var category = wpCategories.FirstOrDefault(c => c.Id == categoryId);
+        var categorySlug = category?.Slug ?? "uncategorized";
+
+        // WordPress URL: /category/post-slug/
+        // Ghost URL: /post-slug/
+        redirects.Add(new
+        {
+            from = $"/{categorySlug}/{post.Slug}/",
+            to = $"/{post.Slug}/",
+            permanent = true
+        });
+    }
+
+    var json = JsonConvert.SerializeObject(redirects, Formatting.Indented);
+    await File.WriteAllTextAsync("redirects.json", json);
+    Console.WriteLine($"Generated {redirects.Count} redirects to redirects.json");
 }
 
 async Task MovePostToGhost(Post wpPost, string targetSlug)
@@ -153,24 +204,62 @@ async Task MovePostToGhost(Post wpPost, string targetSlug)
     // Process images in content
     var content = wpPost.Content.Rendered;
     string? featureImage = null;
+    string? featureImageSrc = null;
 
     html.LoadHtml(content);
     var imgNodes = html.DocumentNode.SelectNodes("//img");
-    foreach (var src in imgNodes.Select(node => node.GetAttributeValue("src", string.Empty)).Where(src => !string.IsNullOrEmpty(src)))
+    foreach (var imgNode in imgNodes)
     {
+        var src = imgNode.GetAttributeValue("src", string.Empty);
+        if (string.IsNullOrEmpty(src)) continue;
+
         try
         {
             // Upload image to Ghost
-            var imageUrl = await ghostClient.UploadImageAsync(src);
-            if (string.IsNullOrEmpty(imageUrl)) continue;
-            
-            content = content.Replace(src, imageUrl);
-            featureImage ??= imageUrl; // First image becomes featured
+            var uploadedUrl = await ghostClient.UploadImageAsync(src);
+            if (string.IsNullOrEmpty(uploadedUrl)) continue;
+
+            // First image becomes featured image
+            if (featureImage == null)
+            {
+                featureImage = uploadedUrl;
+                featureImageSrc = src;
+            }
+            else
+            {
+                // Update other images in content with new URL
+                content = content.Replace(src, uploadedUrl);
+            }
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Failed to upload image {src}: {ex.Message}");
         }
+    }
+
+    // Remove the featured image from content to avoid duplication
+    if (featureImageSrc != null)
+    {
+        html.LoadHtml(content);
+        var featureImgNode = html.DocumentNode.SelectSingleNode($"//img[@src='{featureImageSrc}']");
+        {
+            // Remove the img tag and its parent if it's a figure or empty p/div
+            var parent = featureImgNode.ParentNode;
+            featureImgNode.Remove();
+            if (parent.Name == "figure" || (parent.Name is "p" or "div" && string.IsNullOrWhiteSpace(parent.InnerText)))
+            {
+                parent.Remove();
+            }
+            content = html.DocumentNode.OuterHtml;
+        }
+    }
+
+    // Strip HTML tags from excerpt
+    var excerpt = wpPost.Excerpt.Rendered;
+    if (!string.IsNullOrEmpty(excerpt))
+    {
+        html.LoadHtml(excerpt);
+        excerpt = html.DocumentNode.InnerText.Trim();
     }
 
     // Create Ghost post
@@ -179,7 +268,7 @@ async Task MovePostToGhost(Post wpPost, string targetSlug)
         Title = wpPost.Title.Rendered,
         Slug = targetSlug,
         Html = content,
-        CustomExcerpt = wpPost.Excerpt.Rendered,
+        CustomExcerpt = excerpt,
         Status = wpPost.Status == Status.Publish ? "published" : "draft",
         PublishedAt = wpPost.Date,
         Tags = postTags,
@@ -205,7 +294,7 @@ public class GhostAdminClient
     public GhostAdminClient(string baseUrl, string adminApiKey)
     {
         _baseUrl = baseUrl.TrimEnd('/');
-        _http = new HttpClient();
+        _http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
 
         var parts = adminApiKey.Split(':');
         _keyId = parts[0];
@@ -218,8 +307,10 @@ public class GhostAdminClient
         var key = new SymmetricSecurityKey(_keySecret) { KeyId = _keyId };
         var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 
-        var header = new JwtHeader(credentials);
-        header["kid"] = _keyId;
+        var header = new JwtHeader(credentials)
+        {
+            ["kid"] = _keyId
+        };
 
         var payload = new JwtPayload(
             issuer: null,
@@ -258,7 +349,7 @@ public class GhostAdminClient
             }
 
             var result = JObject.Parse(json);
-            var pagePosts = result["posts"]?.ToObject<List<GhostPost>>() ?? new List<GhostPost>();
+            var pagePosts = result["posts"]?.ToObject<List<GhostPost>>() ?? [];
 
             if (pagePosts.Count == 0) break;
 
@@ -282,7 +373,7 @@ public class GhostAdminClient
         }
 
         var result = JObject.Parse(json);
-        return result["tags"]?.ToObject<List<GhostTag>>() ?? new List<GhostTag>();
+        return result["tags"]?.ToObject<List<GhostTag>>() ?? [];
     }
 
     public async Task<GhostTag?> CreateTagAsync(string slug, string name)
@@ -345,13 +436,16 @@ public class GhostAdminClient
     {
         try
         {
-            // Download image
-            var imageBytes = await _http.GetByteArrayAsync(imageUrl);
             var fileName = Path.GetFileName(new Uri(imageUrl).LocalPath);
             fileName = Regex.Replace(fileName, @"[^\u0000-\u007F]+", "");
             if (fileName.Length > 100) fileName = fileName[..100] + Path.GetExtension(fileName);
 
+            // Download image
+            Console.WriteLine($"  Downloading: {fileName}");
+            var imageBytes = await _http.GetByteArrayAsync(imageUrl);
+
             // Upload to Ghost
+            Console.WriteLine($"  Uploading: {fileName} ({imageBytes.Length / 1024}KB)");
             var request = CreateRequest(HttpMethod.Post, "images/upload/");
 
             using var content = new MultipartFormDataContent();
@@ -366,16 +460,18 @@ public class GhostAdminClient
 
             if (!response.IsSuccessStatusCode)
             {
-                Console.WriteLine($"Image upload failed: {json}");
+                Console.WriteLine($"  Upload failed: {fileName} - {json}");
                 return null;
             }
 
             var result = JObject.Parse(json);
-            return result["images"]?[0]?["url"]?.ToString();
+            var uploadedUrl = result["images"]?[0]?["url"]?.ToString();
+            Console.WriteLine($"  Done: {fileName}");
+            return uploadedUrl;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Image download/upload error: {ex.Message}");
+            Console.WriteLine($"  Error: {ex.Message}");
             return null;
         }
     }
