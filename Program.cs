@@ -26,15 +26,16 @@ List<User>? wpUsers = null;
 List<Category>? wpCategories = null;
 List<GhostPost>? ghostPosts = null;
 List<GhostTag>? ghostTags = null;
+List<GhostAuthor>? ghostAuthors = null;
 
 var wpTagsDict = new Dictionary<int, string>();
-var wpUsersDict = new Dictionary<int, string>();
+var wpUsersDict = new Dictionary<int, User>();
 var ghostTagsDict = new Dictionary<string, string>(); // slug -> ghost id
+var ghostAuthorsDict = new Dictionary<string, GhostAuthor>(); // slug -> ghost author
 
 // await LoadLocalData();
 await DownloadAndSaveAllData();
-// await ProcessPosts();
-await ProcessFivePosts();
+await ProcessPosts(5);
 await GenerateRedirects();
 
 async Task LoadLocalData()
@@ -129,6 +130,7 @@ async Task DownloadAndSaveAllData()
     Console.WriteLine("Downloading Ghost data...");
     ghostPosts = await ghostClient.GetAllPostsAsync();
     ghostTags = await ghostClient.GetAllTagsAsync();
+    ghostAuthors = await ghostClient.GetAllAuthorsAsync();
 
     await File.WriteAllTextAsync("wpUsers.txt", JsonConvert.SerializeObject(wpUsers));
     await File.WriteAllTextAsync("wpTags.txt", JsonConvert.SerializeObject(wpTags));
@@ -136,50 +138,34 @@ async Task DownloadAndSaveAllData()
     await File.WriteAllTextAsync("wpCategories.txt", JsonConvert.SerializeObject(wpCategories));
     await File.WriteAllTextAsync("ghostPosts.txt", JsonConvert.SerializeObject(ghostPosts));
     await File.WriteAllTextAsync("ghostTags.txt", JsonConvert.SerializeObject(ghostTags));
+    await File.WriteAllTextAsync("ghostAuthors.txt", JsonConvert.SerializeObject(ghostAuthors));
 
-    Console.WriteLine($"Saved {wpPosts.Count} WP posts, {ghostPosts.Count} Ghost posts");
+    Console.WriteLine($"Saved {wpPosts.Count} WP posts, {ghostPosts.Count} Ghost posts, {ghostAuthors.Count} Ghost authors");
 }
 
-async Task ProcessPosts()
-{
-    BuildLookupDictionaries();
-    if (wpPosts == null) return;
-
-    var total = wpPosts.Count;
-    var processed = 0;
-
-    foreach (var wpPost in wpPosts)
-    {
-        processed++;
-        var progress = (processed / (decimal)total * 100).ToString("F2");
-        Console.Write($"Progress {progress}% ");
-
-        var targetSlug = wpPost.Slug;
-
-        if (ghostPosts?.Any(p => p.Slug == targetSlug) == true)
-        {
-            Console.WriteLine($"Post already exists: {targetSlug}");
-            continue;
-        }
-
-        await MovePostToGhost(wpPost, targetSlug);
-    }
-}
-
-async Task ProcessFivePosts()
+async Task ProcessPosts(int? count = null)
 {
     BuildLookupDictionaries();
     if (wpPosts == null) return;
 
     var postsToProcess = wpPosts
-        .Where(p => ghostPosts?.Any(g => g.Slug == p.Slug) != true)
-        .Take(5)
-        .ToList();
+        .Where(p => ghostPosts?.Any(g => g.Slug == p.Slug) != true);
 
-    Console.WriteLine($"Processing {postsToProcess.Count} posts...");
+    if (count.HasValue)
+        postsToProcess = postsToProcess.Take(count.Value);
 
-    foreach (var wpPost in postsToProcess)
+    var postsList = postsToProcess.ToList();
+    var total = postsList.Count;
+
+    Console.WriteLine($"Processing {total} posts...");
+
+    var processed = 0;
+    foreach (var wpPost in postsList)
     {
+        processed++;
+        var progress = (processed / (decimal)total * 100).ToString("F2");
+        Console.Write($"Progress {progress}% ");
+
         await MovePostToGhost(wpPost, wpPost.Slug);
     }
 }
@@ -192,11 +178,15 @@ void BuildLookupDictionaries()
 
     if (wpUsers != null)
         foreach (var user in wpUsers)
-            wpUsersDict[user.Id] = user.Slug;
+            wpUsersDict[user.Id] = user;
 
     if (ghostTags != null)
         foreach (var tag in ghostTags)
             ghostTagsDict[tag.Slug] = tag.Id;
+
+    if (ghostAuthors != null)
+        foreach (var author in ghostAuthors)
+            ghostAuthorsDict[author.Slug] = author;
 }
 
 async Task GenerateRedirects()
@@ -324,12 +314,35 @@ async Task MovePostToGhost(Post wpPost, string targetSlug)
         }
     }
 
+    // Process videos in content
+    content = ProcessVideos(content);
+
     // Strip HTML tags from excerpt
     var excerpt = wpPost.Excerpt.Rendered;
     if (!string.IsNullOrEmpty(excerpt))
     {
         html.LoadHtml(excerpt);
         excerpt = html.DocumentNode.InnerText.Trim();
+    }
+
+    // Map WordPress author to Ghost author
+    var postAuthors = new List<GhostAuthor>();
+    if (wpUsersDict.TryGetValue(wpPost.Author, out var wpAuthor))
+    {
+        // Try to find matching Ghost author by slug or name
+        var ghostAuthor = ghostAuthorsDict.Values.FirstOrDefault(a =>
+            a.Slug.Equals(wpAuthor.Slug, StringComparison.OrdinalIgnoreCase) ||
+            a.Name.Equals(wpAuthor.Name, StringComparison.OrdinalIgnoreCase));
+
+        if (ghostAuthor != null)
+        {
+            postAuthors.Add(ghostAuthor);
+            Console.WriteLine($"  Mapped author: {wpAuthor.Name} -> {ghostAuthor.Name}");
+        }
+        else
+        {
+            Console.WriteLine($"  Warning: No matching Ghost author for WP user '{wpAuthor.Name}' (slug: {wpAuthor.Slug})");
+        }
     }
 
     // Create Ghost post
@@ -342,7 +355,8 @@ async Task MovePostToGhost(Post wpPost, string targetSlug)
         Status = wpPost.Status == Status.Publish ? "published" : "draft",
         PublishedAt = wpPost.Date,
         Tags = postTags,
-        FeatureImage = featureImage
+        FeatureImage = featureImage,
+        Authors = postAuthors.Count > 0 ? postAuthors : null
     };
 
     var created = await ghostClient.CreatePostAsync(ghostPost);
@@ -351,6 +365,164 @@ async Task MovePostToGhost(Post wpPost, string targetSlug)
         ghostPosts?.Add(created);
         Console.WriteLine($"Created: {created.Slug}");
     }
+}
+
+string ProcessVideos(string content)
+{
+    var doc = new HtmlDocument();
+    doc.LoadHtml(content);
+    var videosProcessed = 0;
+
+    // Process YouTube links (various formats)
+    // Matches: youtube.com/watch?v=ID, youtu.be/ID, youtube.com/embed/ID
+    var youtubePattern = @"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})";
+
+    // Process Vimeo links
+    // Matches: vimeo.com/ID, player.vimeo.com/video/ID
+    var vimeoPattern = @"(?:https?://)?(?:www\.)?(?:vimeo\.com/|player\.vimeo\.com/video/)(\d+)";
+
+    // Process direct video file links
+    var videoFilePattern = @"(https?://[^\s<>""']+\.(?:mp4|webm|ogg|mov))";
+
+    // Find all anchor tags that link to videos
+    var anchorNodes = doc.DocumentNode.SelectNodes("//a[@href]");
+    if (anchorNodes != null)
+    {
+        foreach (var anchor in anchorNodes.ToList())
+        {
+            var href = anchor.GetAttributeValue("href", "");
+            if (string.IsNullOrEmpty(href)) continue;
+
+            string? embedHtml = null;
+
+            // Check for YouTube
+            var youtubeMatch = Regex.Match(href, youtubePattern);
+            if (youtubeMatch.Success)
+            {
+                var videoId = youtubeMatch.Groups[1].Value;
+                embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe width=""560"" height=""315"" src=""https://www.youtube.com/embed/{videoId}"" frameborder=""0"" allow=""accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"" allowfullscreen></iframe></figure>";
+            }
+
+            // Check for Vimeo
+            if (embedHtml == null)
+            {
+                var vimeoMatch = Regex.Match(href, vimeoPattern);
+                if (vimeoMatch.Success)
+                {
+                    var videoId = vimeoMatch.Groups[1].Value;
+                    embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe src=""https://player.vimeo.com/video/{videoId}"" width=""560"" height=""315"" frameborder=""0"" allow=""autoplay; fullscreen; picture-in-picture"" allowfullscreen></iframe></figure>";
+                }
+            }
+
+            // Check for direct video files
+            if (embedHtml == null)
+            {
+                var videoMatch = Regex.Match(href, videoFilePattern, RegexOptions.IgnoreCase);
+                if (videoMatch.Success)
+                {
+                    var videoUrl = videoMatch.Groups[1].Value;
+                    embedHtml = $@"<figure class=""kg-card kg-video-card""><video controls><source src=""{videoUrl}"" type=""video/{GetVideoMimeType(videoUrl)}"">Your browser does not support the video tag.</video></figure>";
+                }
+            }
+
+            if (embedHtml != null)
+            {
+                // Replace the anchor with the embed
+                var embedNode = HtmlNode.CreateNode(embedHtml);
+                anchor.ParentNode.ReplaceChild(embedNode, anchor);
+                videosProcessed++;
+            }
+        }
+    }
+
+    // Also process existing iframes that might need fixing (YouTube/Vimeo embeds from WordPress)
+    var iframeNodes = doc.DocumentNode.SelectNodes("//iframe[@src]");
+    if (iframeNodes != null)
+    {
+        foreach (var iframe in iframeNodes.ToList())
+        {
+            var src = iframe.GetAttributeValue("src", "");
+            if (string.IsNullOrEmpty(src)) continue;
+
+            // Ensure iframes are wrapped in figure tags for Ghost
+            var parent = iframe.ParentNode;
+            if (parent.Name != "figure")
+            {
+                var figureHtml = $@"<figure class=""kg-card kg-embed-card"">{iframe.OuterHtml}</figure>";
+                var figureNode = HtmlNode.CreateNode(figureHtml);
+                parent.ReplaceChild(figureNode, iframe);
+                videosProcessed++;
+            }
+        }
+    }
+
+    // Process plain text URLs that are YouTube/Vimeo links (not inside anchors)
+    var textNodes = doc.DocumentNode.SelectNodes("//text()[not(ancestor::a) and not(ancestor::script) and not(ancestor::style)]");
+    if (textNodes != null)
+    {
+        foreach (var textNode in textNodes.ToList())
+        {
+            var text = textNode.InnerText;
+            var modified = false;
+
+            // Replace YouTube URLs
+            var youtubeMatches = Regex.Matches(text, youtubePattern);
+            foreach (Match match in youtubeMatches)
+            {
+                var videoId = match.Groups[1].Value;
+                var embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe width=""560"" height=""315"" src=""https://www.youtube.com/embed/{videoId}"" frameborder=""0"" allow=""accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"" allowfullscreen></iframe></figure>";
+                text = text.Replace(match.Value, embedHtml);
+                modified = true;
+                videosProcessed++;
+            }
+
+            // Replace Vimeo URLs
+            var vimeoMatches = Regex.Matches(text, vimeoPattern);
+            foreach (Match match in vimeoMatches)
+            {
+                var videoId = match.Groups[1].Value;
+                var embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe src=""https://player.vimeo.com/video/{videoId}"" width=""560"" height=""315"" frameborder=""0"" allow=""autoplay; fullscreen; picture-in-picture"" allowfullscreen></iframe></figure>";
+                text = text.Replace(match.Value, embedHtml);
+                modified = true;
+                videosProcessed++;
+            }
+
+            // Replace direct video file URLs
+            var videoMatches = Regex.Matches(text, videoFilePattern, RegexOptions.IgnoreCase);
+            foreach (Match match in videoMatches)
+            {
+                var videoUrl = match.Groups[1].Value;
+                var embedHtml = $@"<figure class=""kg-card kg-video-card""><video controls><source src=""{videoUrl}"" type=""video/{GetVideoMimeType(videoUrl)}"">Your browser does not support the video tag.</video></figure>";
+                text = text.Replace(match.Value, embedHtml);
+                modified = true;
+                videosProcessed++;
+            }
+
+            if (modified)
+            {
+                var newNode = HtmlNode.CreateNode($"<span>{text}</span>");
+                textNode.ParentNode.ReplaceChild(newNode, textNode);
+            }
+        }
+    }
+
+    if (videosProcessed > 0)
+        Console.WriteLine($"  Processed {videosProcessed} video(s)");
+
+    return doc.DocumentNode.OuterHtml;
+}
+
+string GetVideoMimeType(string url)
+{
+    var ext = Path.GetExtension(url).ToLower();
+    return ext switch
+    {
+        ".mp4" => "mp4",
+        ".webm" => "webm",
+        ".ogg" => "ogg",
+        ".mov" => "quicktime",
+        _ => "mp4"
+    };
 }
 
 class IdOnly
@@ -470,6 +642,22 @@ public class GhostAdminClient
         return result["tags"]?[0]?.ToObject<GhostTag>();
     }
 
+    public async Task<List<GhostAuthor>> GetAllAuthorsAsync()
+    {
+        var request = CreateRequest(HttpMethod.Get, "users/?limit=all");
+        var response = await _http.SendAsync(request);
+        var json = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+        {
+            Console.WriteLine($"Error getting authors: {json}");
+            return [];
+        }
+
+        var result = JObject.Parse(json);
+        return result["users"]?.ToObject<List<GhostAuthor>>() ?? [];
+    }
+
     public async Task<GhostPost?> CreatePostAsync(GhostPost post)
     {
         var request = CreateRequest(HttpMethod.Post, "posts/?source=html");
@@ -488,7 +676,8 @@ public class GhostAdminClient
             ["custom_excerpt"] = excerpt,
             ["published_at"] = post.PublishedAt?.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
             ["feature_image"] = post.FeatureImage,
-            ["tags"] = post.Tags?.Select(t => new { id = t.Id, slug = t.Slug, name = t.Name }).ToArray()
+            ["tags"] = post.Tags?.Select(t => new { id = t.Id, slug = t.Slug, name = t.Name }).ToArray(),
+            ["authors"] = post.Authors?.Select(a => new { id = a.Id }).ToArray()
         };
 
         var payload = new { posts = new[] { postData } };
@@ -612,6 +801,7 @@ public class GhostPost
     [JsonProperty("published_at")] public DateTime? PublishedAt { get; set; }
     [JsonProperty("feature_image")] public string? FeatureImage { get; set; }
     [JsonProperty("tags")] public List<GhostTag>? Tags { get; set; }
+    [JsonProperty("authors")] public List<GhostAuthor>? Authors { get; set; }
 }
 
 public class GhostTag
@@ -619,4 +809,12 @@ public class GhostTag
     [JsonProperty("id")] public string Id { get; set; } = "";
     [JsonProperty("slug")] public string Slug { get; set; } = "";
     [JsonProperty("name")] public string Name { get; set; } = "";
+}
+
+public class GhostAuthor
+{
+    [JsonProperty("id")] public string Id { get; set; } = "";
+    [JsonProperty("slug")] public string Slug { get; set; } = "";
+    [JsonProperty("name")] public string Name { get; set; } = "";
+    [JsonProperty("email")] public string? Email { get; set; }
 }
