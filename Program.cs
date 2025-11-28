@@ -31,27 +31,97 @@ var wpTagsDict = new Dictionary<int, string>();
 var wpUsersDict = new Dictionary<int, string>();
 var ghostTagsDict = new Dictionary<string, string>(); // slug -> ghost id
 
-await LoadLocalData();
-// await DownloadAndSaveAllData();
+// await LoadLocalData();
+await DownloadAndSaveAllData();
 // await ProcessPosts();
-// await ProcessFivePosts();
+await ProcessFivePosts();
 await GenerateRedirects();
 
 async Task LoadLocalData()
 {
-    wpPosts = JsonConvert.DeserializeObject<List<Post>>(await File.ReadAllTextAsync("wpPosts.txt"));
-    wpTags = JsonConvert.DeserializeObject<List<Tag>>(await File.ReadAllTextAsync("wpTags.txt"));
-    wpUsers = JsonConvert.DeserializeObject<List<User>>(await File.ReadAllTextAsync("wpUsers.txt"));
-    wpCategories = JsonConvert.DeserializeObject<List<Category>>(await File.ReadAllTextAsync("wpCategories.txt"));
-    ghostPosts = JsonConvert.DeserializeObject<List<GhostPost>>(await File.ReadAllTextAsync("ghostPosts.txt"));
-    ghostTags = JsonConvert.DeserializeObject<List<GhostTag>>(await File.ReadAllTextAsync("ghostTags.txt"));
+    if (File.Exists("wpPosts.txt"))
+        wpPosts = JsonConvert.DeserializeObject<List<Post>>(await File.ReadAllTextAsync("wpPosts.txt"));
+    if (File.Exists("wpTags.txt"))
+        wpTags = JsonConvert.DeserializeObject<List<Tag>>(await File.ReadAllTextAsync("wpTags.txt"));
+    if (File.Exists("wpUsers.txt"))
+        wpUsers = JsonConvert.DeserializeObject<List<User>>(await File.ReadAllTextAsync("wpUsers.txt"));
+    if (File.Exists("wpCategories.txt"))
+        wpCategories = JsonConvert.DeserializeObject<List<Category>>(await File.ReadAllTextAsync("wpCategories.txt"));
+    if (File.Exists("ghostPosts.txt"))
+        ghostPosts = JsonConvert.DeserializeObject<List<GhostPost>>(await File.ReadAllTextAsync("ghostPosts.txt"));
+    if (File.Exists("ghostTags.txt"))
+        ghostTags = JsonConvert.DeserializeObject<List<GhostTag>>(await File.ReadAllTextAsync("ghostTags.txt"));
 }
 
 async Task DownloadAndSaveAllData()
 {
-    Console.WriteLine("Downloading WordPress data...");
-    wpPosts = (await wp.Posts.GetAllAsync()).ToList();
-    Console.WriteLine($"Downloaded {wpPosts.Count} WP posts");
+    // Load existing data if available
+    var existingPostIds = new HashSet<int>();
+    if (File.Exists("wpPosts.txt"))
+    {
+        var existingPosts = JsonConvert.DeserializeObject<List<Post>>(await File.ReadAllTextAsync("wpPosts.txt"));
+        if (existingPosts != null)
+        {
+            wpPosts = existingPosts;
+            foreach (var p in existingPosts)
+                existingPostIds.Add(p.Id);
+            Console.WriteLine($"Loaded {existingPostIds.Count} existing WP posts from cache");
+        }
+    }
+
+    wpPosts ??= [];
+
+    // First, fetch only IDs to check what's new (minimal data transfer)
+    Console.WriteLine("Checking for new WordPress posts...");
+    using var http = new HttpClient();
+    var page = 1;
+    var newPostIds = new List<int>();
+
+    while (true)
+    {
+        try
+        {
+            var url = $"https://holographica.space/wp-json/wp/v2/posts?_fields=id&per_page=100&page={page}";
+            var response = await http.GetAsync(url);
+
+            if (!response.IsSuccessStatusCode) break; // No more pages
+
+            var json = await response.Content.ReadAsStringAsync();
+            var ids = JsonConvert.DeserializeObject<List<IdOnly>>(json) ?? [];
+
+            if (ids.Count == 0) break;
+
+            foreach (var item in ids)
+            {
+                if (!existingPostIds.Contains(item.Id))
+                    newPostIds.Add(item.Id);
+            }
+
+            page++;
+        }
+        catch
+        {
+            break; // Error fetching page, stop
+        }
+    }
+
+    Console.WriteLine($"Found {newPostIds.Count} new posts");
+
+    // Download only new posts
+    if (newPostIds.Count > 0)
+    {
+        Console.WriteLine("Downloading new posts...");
+        var downloaded = 0;
+        foreach (var id in newPostIds)
+        {
+            downloaded++;
+            Console.Write($"\r  Downloading post {downloaded}/{newPostIds.Count}...");
+            var post = await wp.Posts.GetByIDAsync(id);
+            wpPosts.Add(post);
+        }
+        Console.WriteLine($"\r  Downloaded {newPostIds.Count} new posts              ");
+    }
+
     wpUsers = (await wp.Users.GetAllAsync()).ToList();
     wpTags = (await wp.Tags.GetAllAsync()).ToList();
     wpCategories = (await wp.Categories.GetAllAsync()).ToList();
@@ -67,7 +137,7 @@ async Task DownloadAndSaveAllData()
     await File.WriteAllTextAsync("ghostPosts.txt", JsonConvert.SerializeObject(ghostPosts));
     await File.WriteAllTextAsync("ghostTags.txt", JsonConvert.SerializeObject(ghostTags));
 
-    Console.WriteLine($"Downloaded {wpPosts.Count} WP posts, {ghostPosts.Count} Ghost posts");
+    Console.WriteLine($"Saved {wpPosts.Count} WP posts, {ghostPosts.Count} Ghost posts");
 }
 
 async Task ProcessPosts()
@@ -283,6 +353,11 @@ async Task MovePostToGhost(Post wpPost, string targetSlug)
     }
 }
 
+class IdOnly
+{
+    [JsonProperty("id")] public int Id { get; set; }
+}
+
 // Ghost API client
 public class GhostAdminClient
 {
@@ -440,12 +515,43 @@ public class GhostAdminClient
             fileName = Regex.Replace(fileName, @"[^\u0000-\u007F]+", "");
             if (fileName.Length > 100) fileName = fileName[..100] + Path.GetExtension(fileName);
 
-            // Download image
-            Console.WriteLine($"  Downloading: {fileName}");
-            var imageBytes = await _http.GetByteArrayAsync(imageUrl);
+            // Download image with progress
+            Console.Write($"  Downloading: {fileName}");
+            var downloadStart = DateTime.Now;
 
-            // Upload to Ghost
-            Console.WriteLine($"  Uploading: {fileName} ({imageBytes.Length / 1024}KB)");
+            using var downloadResponse = await _http.GetAsync(imageUrl, HttpCompletionOption.ResponseHeadersRead);
+            var totalBytes = downloadResponse.Content.Headers.ContentLength ?? 0;
+            Console.Write($" ({totalBytes / 1024}KB)");
+
+            await using var downloadStream = await downloadResponse.Content.ReadAsStreamAsync();
+            using var memoryStream = new MemoryStream();
+            var buffer = new byte[81920];
+            int bytesRead;
+            long totalRead = 0;
+
+            while ((bytesRead = await downloadStream.ReadAsync(buffer)) > 0)
+            {
+                await memoryStream.WriteAsync(buffer.AsMemory(0, bytesRead));
+                totalRead += bytesRead;
+                if (totalBytes > 0)
+                {
+                    var percent = (int)(totalRead * 100 / totalBytes);
+                    var elapsed = (DateTime.Now - downloadStart).TotalSeconds;
+                    var speed = elapsed > 0 ? totalRead / 1024 / elapsed : 0;
+                    Console.Write($"\r  Downloading: {fileName} ({totalBytes / 1024}KB) {percent}% @ {speed:F0}KB/s    ");
+                }
+            }
+
+            var downloadTime = (DateTime.Now - downloadStart).TotalSeconds;
+            var downloadSpeed = downloadTime > 0 ? totalRead / 1024 / downloadTime : 0;
+            Console.WriteLine($"\r  Downloaded: {fileName} ({totalRead / 1024}KB) @ {downloadSpeed:F0}KB/s              ");
+
+            var imageBytes = memoryStream.ToArray();
+
+            // Upload to Ghost with progress
+            Console.Write($"  Uploading: {fileName} ({imageBytes.Length / 1024}KB)");
+            var uploadStart = DateTime.Now;
+
             var request = CreateRequest(HttpMethod.Post, "images/upload/");
 
             using var content = new MultipartFormDataContent();
@@ -456,22 +562,25 @@ public class GhostAdminClient
             request.Content = content;
 
             var response = await _http.SendAsync(request);
+            var uploadTime = (DateTime.Now - uploadStart).TotalSeconds;
+            var uploadSpeed = uploadTime > 0 ? imageBytes.Length / 1024 / uploadTime : 0;
+
             var json = await response.Content.ReadAsStringAsync();
 
             if (!response.IsSuccessStatusCode)
             {
-                Console.WriteLine($"  Upload failed: {fileName} - {json}");
+                Console.WriteLine($"\r  Upload failed: {fileName} - {json}                    ");
                 return null;
             }
 
             var result = JObject.Parse(json);
             var uploadedUrl = result["images"]?[0]?["url"]?.ToString();
-            Console.WriteLine($"  Done: {fileName}");
+            Console.WriteLine($"\r  Uploaded: {fileName} ({imageBytes.Length / 1024}KB) @ {uploadSpeed:F0}KB/s              ");
             return uploadedUrl;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"  Error: {ex.Message}");
+            Console.WriteLine($"\n  Error: {ex.Message}");
             return null;
         }
     }
