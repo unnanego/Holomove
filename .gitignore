@@ -1,0 +1,34 @@
+# Build output
+bin/
+obj/
+
+# Visual Studio files
+.vs/
+*.user
+*.suo
+
+# Rider / VS Code
+.idea/
+*.iml
+.vscode/
+
+# NuGet packages
+*.nupkg
+packages/
+
+# Logs
+*.log
+
+# Temp files
+*.tmp
+*.temp
+
+# ASP.NET Core
+wwwroot/lib/
+
+# Auto-generated files
+*.g.cs
+*.g.i.cs
+
+# Publish output
+PublishProfiles/
