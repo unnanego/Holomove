@@ -1,7 +1,14 @@
+using System;
+using System.Collections.Generic;
 using System.IdentityModel.Tokens.Jwt;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using HtmlAgilityPack;
 using Microsoft.IdentityModel.Tokens;
 using Newtonsoft.Json;
@@ -22,7 +29,7 @@ var ghostClient = new GhostAdminClient(ghostUrl, ghostAdminApiKey);
 
 List<Post>? wpPosts = null;
 List<Tag>? wpTags = null;
-List<User>? wpUsers = null;
+List<User>? wpAuthors = null;
 List<Category>? wpCategories = null;
 List<GhostPost>? ghostPosts = null;
 List<GhostTag>? ghostTags = null;
@@ -45,7 +52,7 @@ async Task LoadLocalData()
     if (File.Exists("wpTags.txt"))
         wpTags = JsonConvert.DeserializeObject<List<Tag>>(await File.ReadAllTextAsync("wpTags.txt"));
     if (File.Exists("wpUsers.txt"))
-        wpUsers = JsonConvert.DeserializeObject<List<User>>(await File.ReadAllTextAsync("wpUsers.txt"));
+        wpAuthors = JsonConvert.DeserializeObject<List<User>>(await File.ReadAllTextAsync("wpUsers.txt"));
     if (File.Exists("wpCategories.txt"))
         wpCategories = JsonConvert.DeserializeObject<List<Category>>(await File.ReadAllTextAsync("wpCategories.txt"));
     if (File.Exists("ghostPosts.txt"))
@@ -123,7 +130,7 @@ async Task DownloadAndSaveAllData()
         Console.WriteLine($"\r  Downloaded {newPostIds.Count} new posts              ");
     }
 
-    wpUsers = (await wp.Users.GetAllAsync()).ToList();
+    wpAuthors = (await wp.Users.GetAllAsync()).ToList();
     wpTags = (await wp.Tags.GetAllAsync()).ToList();
     wpCategories = (await wp.Categories.GetAllAsync()).ToList();
 
@@ -132,7 +139,7 @@ async Task DownloadAndSaveAllData()
     ghostTags = await ghostClient.GetAllTagsAsync();
     ghostAuthors = await ghostClient.GetAllAuthorsAsync();
 
-    await File.WriteAllTextAsync("wpUsers.txt", JsonConvert.SerializeObject(wpUsers));
+    await File.WriteAllTextAsync("wpUsers.txt", JsonConvert.SerializeObject(wpAuthors));
     await File.WriteAllTextAsync("wpTags.txt", JsonConvert.SerializeObject(wpTags));
     await File.WriteAllTextAsync("wpPosts.txt", JsonConvert.SerializeObject(wpPosts));
     await File.WriteAllTextAsync("wpCategories.txt", JsonConvert.SerializeObject(wpCategories));
@@ -176,8 +183,8 @@ void BuildLookupDictionaries()
         foreach (var tag in wpTags)
             wpTagsDict[tag.Id] = tag.Slug;
 
-    if (wpUsers != null)
-        foreach (var user in wpUsers)
+    if (wpAuthors != null)
+        foreach (var user in wpAuthors)
             wpUsersDict[user.Id] = user;
 
     if (ghostTags != null)
@@ -386,123 +393,114 @@ string ProcessVideos(string content)
 
     // Find all anchor tags that link to videos
     var anchorNodes = doc.DocumentNode.SelectNodes("//a[@href]");
-    if (anchorNodes != null)
+    foreach (var anchor in anchorNodes.ToList())
     {
-        foreach (var anchor in anchorNodes.ToList())
+        var href = anchor.GetAttributeValue("href", "");
+        if (string.IsNullOrEmpty(href)) continue;
+
+        string? embedHtml = null;
+
+        // Check for YouTube
+        var youtubeMatch = Regex.Match(href, youtubePattern);
+        if (youtubeMatch.Success)
         {
-            var href = anchor.GetAttributeValue("href", "");
-            if (string.IsNullOrEmpty(href)) continue;
+            var videoId = youtubeMatch.Groups[1].Value;
+            embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe width=""560"" height=""315"" src=""https://www.youtube.com/embed/{videoId}"" frameborder=""0"" allow=""accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"" allowfullscreen></iframe></figure>";
+        }
 
-            string? embedHtml = null;
-
-            // Check for YouTube
-            var youtubeMatch = Regex.Match(href, youtubePattern);
-            if (youtubeMatch.Success)
+        // Check for Vimeo
+        if (embedHtml == null)
+        {
+            var vimeoMatch = Regex.Match(href, vimeoPattern);
+            if (vimeoMatch.Success)
             {
-                var videoId = youtubeMatch.Groups[1].Value;
-                embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe width=""560"" height=""315"" src=""https://www.youtube.com/embed/{videoId}"" frameborder=""0"" allow=""accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"" allowfullscreen></iframe></figure>";
+                var videoId = vimeoMatch.Groups[1].Value;
+                embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe src=""https://player.vimeo.com/video/{videoId}"" width=""560"" height=""315"" frameborder=""0"" allow=""autoplay; fullscreen; picture-in-picture"" allowfullscreen></iframe></figure>";
             }
+        }
 
-            // Check for Vimeo
-            if (embedHtml == null)
+        // Check for direct video files
+        if (embedHtml == null)
+        {
+            var videoMatch = Regex.Match(href, videoFilePattern, RegexOptions.IgnoreCase);
+            if (videoMatch.Success)
             {
-                var vimeoMatch = Regex.Match(href, vimeoPattern);
-                if (vimeoMatch.Success)
-                {
-                    var videoId = vimeoMatch.Groups[1].Value;
-                    embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe src=""https://player.vimeo.com/video/{videoId}"" width=""560"" height=""315"" frameborder=""0"" allow=""autoplay; fullscreen; picture-in-picture"" allowfullscreen></iframe></figure>";
-                }
+                var videoUrl = videoMatch.Groups[1].Value;
+                embedHtml = $@"<figure class=""kg-card kg-video-card""><video controls><source src=""{videoUrl}"" type=""video/{GetVideoMimeType(videoUrl)}"">Your browser does not support the video tag.</video></figure>";
             }
+        }
 
-            // Check for direct video files
-            if (embedHtml == null)
-            {
-                var videoMatch = Regex.Match(href, videoFilePattern, RegexOptions.IgnoreCase);
-                if (videoMatch.Success)
-                {
-                    var videoUrl = videoMatch.Groups[1].Value;
-                    embedHtml = $@"<figure class=""kg-card kg-video-card""><video controls><source src=""{videoUrl}"" type=""video/{GetVideoMimeType(videoUrl)}"">Your browser does not support the video tag.</video></figure>";
-                }
-            }
-
-            if (embedHtml != null)
-            {
-                // Replace the anchor with the embed
-                var embedNode = HtmlNode.CreateNode(embedHtml);
-                anchor.ParentNode.ReplaceChild(embedNode, anchor);
-                videosProcessed++;
-            }
+        if (embedHtml != null)
+        {
+            // Replace the anchor with the embed
+            var embedNode = HtmlNode.CreateNode(embedHtml);
+            anchor.ParentNode.ReplaceChild(embedNode, anchor);
+            videosProcessed++;
         }
     }
 
     // Also process existing iframes that might need fixing (YouTube/Vimeo embeds from WordPress)
     var iframeNodes = doc.DocumentNode.SelectNodes("//iframe[@src]");
-    if (iframeNodes != null)
+    foreach (var iframe in iframeNodes.ToList())
     {
-        foreach (var iframe in iframeNodes.ToList())
-        {
-            var src = iframe.GetAttributeValue("src", "");
-            if (string.IsNullOrEmpty(src)) continue;
+        var src = iframe.GetAttributeValue("src", "");
+        if (string.IsNullOrEmpty(src)) continue;
 
-            // Ensure iframes are wrapped in figure tags for Ghost
-            var parent = iframe.ParentNode;
-            if (parent.Name != "figure")
-            {
-                var figureHtml = $@"<figure class=""kg-card kg-embed-card"">{iframe.OuterHtml}</figure>";
-                var figureNode = HtmlNode.CreateNode(figureHtml);
-                parent.ReplaceChild(figureNode, iframe);
-                videosProcessed++;
-            }
+        // Ensure iframes are wrapped in figure tags for Ghost
+        var parent = iframe.ParentNode;
+        if (parent.Name != "figure")
+        {
+            var figureHtml = $@"<figure class=""kg-card kg-embed-card"">{iframe.OuterHtml}</figure>";
+            var figureNode = HtmlNode.CreateNode(figureHtml);
+            parent.ReplaceChild(figureNode, iframe);
+            videosProcessed++;
         }
     }
 
     // Process plain text URLs that are YouTube/Vimeo links (not inside anchors)
     var textNodes = doc.DocumentNode.SelectNodes("//text()[not(ancestor::a) and not(ancestor::script) and not(ancestor::style)]");
-    if (textNodes != null)
+    foreach (var textNode in textNodes.ToList())
     {
-        foreach (var textNode in textNodes.ToList())
+        var text = textNode.InnerText;
+        var modified = false;
+
+        // Replace YouTube URLs
+        var youtubeMatches = Regex.Matches(text, youtubePattern);
+        foreach (Match match in youtubeMatches)
         {
-            var text = textNode.InnerText;
-            var modified = false;
+            var videoId = match.Groups[1].Value;
+            var embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe width=""560"" height=""315"" src=""https://www.youtube.com/embed/{videoId}"" frameborder=""0"" allow=""accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"" allowfullscreen></iframe></figure>";
+            text = text.Replace(match.Value, embedHtml);
+            modified = true;
+            videosProcessed++;
+        }
 
-            // Replace YouTube URLs
-            var youtubeMatches = Regex.Matches(text, youtubePattern);
-            foreach (Match match in youtubeMatches)
-            {
-                var videoId = match.Groups[1].Value;
-                var embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe width=""560"" height=""315"" src=""https://www.youtube.com/embed/{videoId}"" frameborder=""0"" allow=""accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"" allowfullscreen></iframe></figure>";
-                text = text.Replace(match.Value, embedHtml);
-                modified = true;
-                videosProcessed++;
-            }
+        // Replace Vimeo URLs
+        var vimeoMatches = Regex.Matches(text, vimeoPattern);
+        foreach (Match match in vimeoMatches)
+        {
+            var videoId = match.Groups[1].Value;
+            var embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe src=""https://player.vimeo.com/video/{videoId}"" width=""560"" height=""315"" frameborder=""0"" allow=""autoplay; fullscreen; picture-in-picture"" allowfullscreen></iframe></figure>";
+            text = text.Replace(match.Value, embedHtml);
+            modified = true;
+            videosProcessed++;
+        }
 
-            // Replace Vimeo URLs
-            var vimeoMatches = Regex.Matches(text, vimeoPattern);
-            foreach (Match match in vimeoMatches)
-            {
-                var videoId = match.Groups[1].Value;
-                var embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe src=""https://player.vimeo.com/video/{videoId}"" width=""560"" height=""315"" frameborder=""0"" allow=""autoplay; fullscreen; picture-in-picture"" allowfullscreen></iframe></figure>";
-                text = text.Replace(match.Value, embedHtml);
-                modified = true;
-                videosProcessed++;
-            }
+        // Replace direct video file URLs
+        var videoMatches = Regex.Matches(text, videoFilePattern, RegexOptions.IgnoreCase);
+        foreach (Match match in videoMatches)
+        {
+            var videoUrl = match.Groups[1].Value;
+            var embedHtml = $@"<figure class=""kg-card kg-video-card""><video controls><source src=""{videoUrl}"" type=""video/{GetVideoMimeType(videoUrl)}"">Your browser does not support the video tag.</video></figure>";
+            text = text.Replace(match.Value, embedHtml);
+            modified = true;
+            videosProcessed++;
+        }
 
-            // Replace direct video file URLs
-            var videoMatches = Regex.Matches(text, videoFilePattern, RegexOptions.IgnoreCase);
-            foreach (Match match in videoMatches)
-            {
-                var videoUrl = match.Groups[1].Value;
-                var embedHtml = $@"<figure class=""kg-card kg-video-card""><video controls><source src=""{videoUrl}"" type=""video/{GetVideoMimeType(videoUrl)}"">Your browser does not support the video tag.</video></figure>";
-                text = text.Replace(match.Value, embedHtml);
-                modified = true;
-                videosProcessed++;
-            }
-
-            if (modified)
-            {
-                var newNode = HtmlNode.CreateNode($"<span>{text}</span>");
-                textNode.ParentNode.ReplaceChild(newNode, textNode);
-            }
+        if (modified)
+        {
+            var newNode = HtmlNode.CreateNode($"<span>{text}</span>");
+            textNode.ParentNode.ReplaceChild(newNode, textNode);
         }
     }
 
