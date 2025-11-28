@@ -1,14 +1,8 @@
-using System;
-using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.IdentityModel.Tokens.Jwt;
-using System.IO;
-using System.Linq;
-using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
 using HtmlAgilityPack;
 using Microsoft.IdentityModel.Tokens;
 using Newtonsoft.Json;
@@ -17,6 +11,10 @@ using WordPressPCL;
 using WordPressPCL.Models;
 
 var html = new HtmlDocument();
+
+// Data files location
+const string dataFolder = @"C:\Users\unnanego\Desktop\downloads";
+Directory.CreateDirectory(dataFolder);
 
 // Source: WordPress
 var wp = new WordPressClient("https://holographica.space/wp-json/");
@@ -42,32 +40,33 @@ var ghostAuthorsDict = new Dictionary<string, GhostAuthor>(); // slug -> ghost a
 
 // await LoadLocalData();
 await DownloadAndSaveAllData();
-await ProcessPosts(5);
+await ProcessPosts(20);
 await GenerateRedirects();
 
-async Task LoadLocalData()
-{
-    if (File.Exists("wpPosts.txt"))
-        wpPosts = JsonConvert.DeserializeObject<List<Post>>(await File.ReadAllTextAsync("wpPosts.txt"));
-    if (File.Exists("wpTags.txt"))
-        wpTags = JsonConvert.DeserializeObject<List<Tag>>(await File.ReadAllTextAsync("wpTags.txt"));
-    if (File.Exists("wpUsers.txt"))
-        wpAuthors = JsonConvert.DeserializeObject<List<User>>(await File.ReadAllTextAsync("wpUsers.txt"));
-    if (File.Exists("wpCategories.txt"))
-        wpCategories = JsonConvert.DeserializeObject<List<Category>>(await File.ReadAllTextAsync("wpCategories.txt"));
-    if (File.Exists("ghostPosts.txt"))
-        ghostPosts = JsonConvert.DeserializeObject<List<GhostPost>>(await File.ReadAllTextAsync("ghostPosts.txt"));
-    if (File.Exists("ghostTags.txt"))
-        ghostTags = JsonConvert.DeserializeObject<List<GhostTag>>(await File.ReadAllTextAsync("ghostTags.txt"));
-}
+// async Task LoadLocalData()
+// {
+//     if (File.Exists("wpPosts.txt"))
+//         wpPosts = JsonConvert.DeserializeObject<List<Post>>(await File.ReadAllTextAsync("wpPosts.txt"));
+//     if (File.Exists("wpTags.txt"))
+//         wpTags = JsonConvert.DeserializeObject<List<Tag>>(await File.ReadAllTextAsync("wpTags.txt"));
+//     if (File.Exists("wpUsers.txt"))
+//         wpAuthors = JsonConvert.DeserializeObject<List<User>>(await File.ReadAllTextAsync("wpUsers.txt"));
+//     if (File.Exists("wpCategories.txt"))
+//         wpCategories = JsonConvert.DeserializeObject<List<Category>>(await File.ReadAllTextAsync("wpCategories.txt"));
+//     if (File.Exists("ghostPosts.txt"))
+//         ghostPosts = JsonConvert.DeserializeObject<List<GhostPost>>(await File.ReadAllTextAsync("ghostPosts.txt"));
+//     if (File.Exists("ghostTags.txt"))
+//         ghostTags = JsonConvert.DeserializeObject<List<GhostTag>>(await File.ReadAllTextAsync("ghostTags.txt"));
+// }
 
 async Task DownloadAndSaveAllData()
 {
     // Load existing data if available
     var existingPostIds = new HashSet<int>();
-    if (File.Exists("wpPosts.txt"))
+    var wpPostsFile = Path.Combine(dataFolder, "wpPosts.txt");
+    if (File.Exists(wpPostsFile))
     {
-        var existingPosts = JsonConvert.DeserializeObject<List<Post>>(await File.ReadAllTextAsync("wpPosts.txt"));
+        var existingPosts = JsonConvert.DeserializeObject<List<Post>>(await File.ReadAllTextAsync(wpPostsFile));
         if (existingPosts != null)
         {
             wpPosts = existingPosts;
@@ -139,13 +138,13 @@ async Task DownloadAndSaveAllData()
     ghostTags = await ghostClient.GetAllTagsAsync();
     ghostAuthors = await ghostClient.GetAllAuthorsAsync();
 
-    await File.WriteAllTextAsync("wpUsers.txt", JsonConvert.SerializeObject(wpAuthors));
-    await File.WriteAllTextAsync("wpTags.txt", JsonConvert.SerializeObject(wpTags));
-    await File.WriteAllTextAsync("wpPosts.txt", JsonConvert.SerializeObject(wpPosts));
-    await File.WriteAllTextAsync("wpCategories.txt", JsonConvert.SerializeObject(wpCategories));
-    await File.WriteAllTextAsync("ghostPosts.txt", JsonConvert.SerializeObject(ghostPosts));
-    await File.WriteAllTextAsync("ghostTags.txt", JsonConvert.SerializeObject(ghostTags));
-    await File.WriteAllTextAsync("ghostAuthors.txt", JsonConvert.SerializeObject(ghostAuthors));
+    await File.WriteAllTextAsync(Path.Combine(dataFolder, "wpUsers.txt"), JsonConvert.SerializeObject(wpAuthors));
+    await File.WriteAllTextAsync(Path.Combine(dataFolder, "wpTags.txt"), JsonConvert.SerializeObject(wpTags));
+    await File.WriteAllTextAsync(wpPostsFile, JsonConvert.SerializeObject(wpPosts));
+    await File.WriteAllTextAsync(Path.Combine(dataFolder, "wpCategories.txt"), JsonConvert.SerializeObject(wpCategories));
+    await File.WriteAllTextAsync(Path.Combine(dataFolder, "ghostPosts.txt"), JsonConvert.SerializeObject(ghostPosts));
+    await File.WriteAllTextAsync(Path.Combine(dataFolder, "ghostTags.txt"), JsonConvert.SerializeObject(ghostTags));
+    await File.WriteAllTextAsync(Path.Combine(dataFolder, "ghostAuthors.txt"), JsonConvert.SerializeObject(ghostAuthors));
 
     Console.WriteLine($"Saved {wpPosts.Count} WP posts, {ghostPosts.Count} Ghost posts, {ghostAuthors.Count} Ghost authors");
 }
@@ -220,8 +219,9 @@ async Task GenerateRedirects()
     }
 
     var json = JsonConvert.SerializeObject(redirects, Formatting.Indented);
-    await File.WriteAllTextAsync("redirects.json", json);
-    Console.WriteLine($"Generated {redirects.Count} redirects to redirects.json");
+    var redirectsFile = Path.Combine(dataFolder, "redirects.json");
+    await File.WriteAllTextAsync(redirectsFile, json);
+    Console.WriteLine($"Generated {redirects.Count} redirects to {redirectsFile}");
 }
 
 async Task MovePostToGhost(Post wpPost, string targetSlug)
@@ -320,6 +320,12 @@ async Task MovePostToGhost(Post wpPost, string targetSlug)
             content = html.DocumentNode.OuterHtml;
         }
     }
+
+    // Process file links (PDFs, documents, etc.) stored in WordPress
+    content = await ProcessFileLinks(content, ghostClient);
+
+    // Convert TablePress tables to Ghost tables
+    content = ProcessTablePressTables(content);
 
     // Process videos in content
     content = ProcessVideos(content);
@@ -523,6 +529,188 @@ string GetVideoMimeType(string url)
     };
 }
 
+async Task<string> ProcessFileLinks(string content, GhostAdminClient client)
+{
+    var doc = new HtmlDocument();
+    doc.LoadHtml(content);
+    var filesProcessed = 0;
+
+    // Pattern to match internal WordPress storage URLs
+    var internalStoragePattern = @"https?://holographica\.space/wp-content/uploads/[^\s""'<>]+";
+
+    // Find all anchor tags that link to internal files
+    var anchorNodes = doc.DocumentNode.SelectNodes("//a[@href]");
+    foreach (var anchor in anchorNodes.ToList())
+    {
+        var href = anchor.GetAttributeValue("href", "");
+        if (string.IsNullOrEmpty(href)) continue;
+
+        // Check if this is an internal storage link (not an image - those are handled separately)
+        if (Regex.IsMatch(href, internalStoragePattern, RegexOptions.IgnoreCase))
+        {
+            var ext = Path.GetExtension(href).ToLower();
+            // Skip image files - they're handled by the image processor
+            if (ext is ".jpg" or ".jpeg" or ".png" or ".gif" or ".webp" or ".svg")
+                continue;
+
+            try
+            {
+                var uploadedUrl = await client.UploadFileAsync(href);
+                if (!string.IsNullOrEmpty(uploadedUrl))
+                {
+                    anchor.SetAttributeValue("href", uploadedUrl);
+                    filesProcessed++;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  Failed to upload file {href}: {ex.Message}");
+            }
+        }
+    }
+
+    if (filesProcessed > 0)
+        Console.WriteLine($"  Processed {filesProcessed} file link(s)");
+
+    return doc.DocumentNode.OuterHtml;
+}
+
+string ProcessTablePressTables(string content)
+{
+    var doc = new HtmlDocument();
+    doc.LoadHtml(content);
+    var tablesProcessed = 0;
+
+    // TablePress uses various container structures:
+    // - <div class="tablepress-scroll-wrapper">
+    // - <table class="tablepress tablepress-id-X">
+    // Also handle shortcode remnants like [table id=X /] or [tablepress id=X /]
+
+    // First, replace any remaining TablePress shortcodes with empty string (they won't render anyway)
+    content = Regex.Replace(content, @"\[table\s+id=[^\]]+\s*/?\]", "", RegexOptions.IgnoreCase);
+    content = Regex.Replace(content, @"\[tablepress\s+id=[^\]]+\s*/?\]", "", RegexOptions.IgnoreCase);
+    content = Regex.Replace(content, @"\[/table\]", "", RegexOptions.IgnoreCase);
+    content = Regex.Replace(content, @"\[/tablepress\]", "", RegexOptions.IgnoreCase);
+
+    // Reload after shortcode removal
+    doc.LoadHtml(content);
+
+    // Find all TablePress tables
+    var tablePressNodes = doc.DocumentNode.SelectNodes("//table[contains(@class, 'tablepress')]");
+    foreach (var table in tablePressNodes.ToList())
+    {
+        // Create a clean Ghost-compatible table
+        var newTable = doc.CreateElement("table");
+
+        // Process thead if exists
+        var thead = table.SelectSingleNode(".//thead");
+        {
+            var newThead = doc.CreateElement("thead");
+            var headerRows = thead.SelectNodes(".//tr");
+            foreach (var row in headerRows)
+            {
+                var newRow = doc.CreateElement("tr");
+                var cells = row.SelectNodes(".//th|.//td");
+                foreach (var cell in cells)
+                {
+                    var newCell = doc.CreateElement("th");
+                    newCell.InnerHtml = cell.InnerHtml.Trim();
+                    // Preserve colspan/rowspan if present
+                    var colspan = cell.GetAttributeValue("colspan", "");
+                    var rowspan = cell.GetAttributeValue("rowspan", "");
+                    if (!string.IsNullOrEmpty(colspan)) newCell.SetAttributeValue("colspan", colspan);
+                    if (!string.IsNullOrEmpty(rowspan)) newCell.SetAttributeValue("rowspan", rowspan);
+                    newRow.AppendChild(newCell);
+                }
+                newThead.AppendChild(newRow);
+            }
+            newTable.AppendChild(newThead);
+        }
+
+        // Process tbody
+        var tbody = table.SelectSingleNode(".//tbody");
+        {
+            var newTbody = doc.CreateElement("tbody");
+            var bodyRows = tbody.SelectNodes(".//tr");
+            foreach (var row in bodyRows)
+            {
+                var newRow = doc.CreateElement("tr");
+                var cells = row.SelectNodes(".//td|.//th");
+                foreach (var cell in cells)
+                {
+                    var newCell = doc.CreateElement("td");
+                    newCell.InnerHtml = cell.InnerHtml.Trim();
+                    // Preserve colspan/rowspan if present
+                    var colspan = cell.GetAttributeValue("colspan", "");
+                    var rowspan = cell.GetAttributeValue("rowspan", "");
+                    if (!string.IsNullOrEmpty(colspan)) newCell.SetAttributeValue("colspan", colspan);
+                    if (!string.IsNullOrEmpty(rowspan)) newCell.SetAttributeValue("rowspan", rowspan);
+                    newRow.AppendChild(newCell);
+                }
+                newTbody.AppendChild(newRow);
+            }
+            newTable.AppendChild(newTbody);
+        }
+
+        // Process tfoot if exists
+        var tfoot = table.SelectSingleNode(".//tfoot");
+        {
+            var newTfoot = doc.CreateElement("tfoot");
+            var footerRows = tfoot.SelectNodes(".//tr");
+            foreach (var row in footerRows)
+            {
+                var newRow = doc.CreateElement("tr");
+                var cells = row.SelectNodes(".//td|.//th");
+                foreach (var cell in cells)
+                {
+                    var newCell = doc.CreateElement("td");
+                    newCell.InnerHtml = cell.InnerHtml.Trim();
+                    var colspan = cell.GetAttributeValue("colspan", "");
+                    var rowspan = cell.GetAttributeValue("rowspan", "");
+                    if (!string.IsNullOrEmpty(colspan)) newCell.SetAttributeValue("colspan", colspan);
+                    if (!string.IsNullOrEmpty(rowspan)) newCell.SetAttributeValue("rowspan", rowspan);
+                    newRow.AppendChild(newCell);
+                }
+                newTfoot.AppendChild(newRow);
+            }
+            newTable.AppendChild(newTfoot);
+        }
+
+        // Find the wrapper div if it exists and replace the whole thing
+        var parent = table.ParentNode;
+        if (parent.Name == "div" &&
+            (parent.GetAttributeValue("class", "").Contains("tablepress") ||
+             parent.GetAttributeValue("class", "").Contains("tablepress-scroll-wrapper")))
+        {
+            // Replace the wrapper div with the clean table
+            parent.ParentNode.ReplaceChild(newTable, parent);
+        }
+        else
+        {
+            // Just replace the table
+            parent.ReplaceChild(newTable, table);
+        }
+
+        tablesProcessed++;
+    }
+
+    // Also clean up any empty TablePress wrapper divs that might remain
+    doc = new HtmlDocument();
+    doc.LoadHtml(doc.DocumentNode.OuterHtml);
+    var wrapperDivs = doc.DocumentNode.SelectNodes("//div[contains(@class, 'tablepress-scroll-wrapper')]");
+    foreach (var wrapper in wrapperDivs.ToList())
+    {
+        // If it just contains a table, unwrap it
+        var innerTable = wrapper.SelectSingleNode(".//table");
+        wrapper.ParentNode.ReplaceChild(innerTable, wrapper);
+    }
+
+    if (tablesProcessed > 0)
+        Console.WriteLine($"  Processed {tablesProcessed} TablePress table(s)");
+
+    return doc.DocumentNode.OuterHtml;
+}
+
 class IdOnly
 {
     [JsonProperty("id")] public int Id { get; set; }
@@ -694,6 +882,7 @@ public class GhostAdminClient
         return result["posts"]?[0]?.ToObject<GhostPost>();
     }
 
+    [SuppressMessage("ReSharper", "PossibleLossOfFraction")]
     public async Task<string?> UploadImageAsync(string imageUrl)
     {
         try
@@ -720,13 +909,11 @@ public class GhostAdminClient
             {
                 await memoryStream.WriteAsync(buffer.AsMemory(0, bytesRead));
                 totalRead += bytesRead;
-                if (totalBytes > 0)
-                {
-                    var percent = (int)(totalRead * 100 / totalBytes);
-                    var elapsed = (DateTime.Now - downloadStart).TotalSeconds;
-                    var speed = elapsed > 0 ? totalRead / 1024 / elapsed : 0;
-                    Console.Write($"\r  Downloading: {fileName} ({totalBytes / 1024}KB) {percent}% @ {speed:F0}KB/s    ");
-                }
+                if (totalBytes <= 0) continue;
+                var percent = (int)(totalRead * 100 / totalBytes);
+                var elapsed = (DateTime.Now - downloadStart).TotalSeconds;
+                var speed = elapsed > 0 ? totalRead / 1024 / elapsed : 0;
+                Console.Write($"\r  Downloading: {fileName} ({totalBytes / 1024}KB) {percent}% @ {speed:F0}KB/s    ");
             }
 
             var downloadTime = (DateTime.Now - downloadStart).TotalSeconds;
@@ -782,8 +969,98 @@ public class GhostAdminClient
             ".gif" => "image/gif",
             ".webp" => "image/webp",
             ".svg" => "image/svg+xml",
+            ".pdf" => "application/pdf",
+            ".doc" => "application/msword",
+            ".docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xls" => "application/vnd.ms-excel",
+            ".xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".ppt" => "application/vnd.ms-powerpoint",
+            ".pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".zip" => "application/zip",
+            ".rar" => "application/vnd.rar",
+            ".txt" => "text/plain",
+            ".csv" => "text/csv",
             _ => "application/octet-stream"
         };
+    }
+
+    [SuppressMessage("ReSharper", "PossibleLossOfFraction")]
+    public async Task<string?> UploadFileAsync(string fileUrl)
+    {
+        try
+        {
+            var fileName = Path.GetFileName(new Uri(fileUrl).LocalPath);
+            fileName = Regex.Replace(fileName, @"[^\u0000-\u007F]+", "");
+            if (fileName.Length > 100) fileName = fileName[..100] + Path.GetExtension(fileName);
+
+            // Download file with progress
+            Console.Write($"  Downloading file: {fileName}");
+            var downloadStart = DateTime.Now;
+
+            using var downloadResponse = await _http.GetAsync(fileUrl, HttpCompletionOption.ResponseHeadersRead);
+            var totalBytes = downloadResponse.Content.Headers.ContentLength ?? 0;
+            Console.Write($" ({totalBytes / 1024}KB)");
+
+            await using var downloadStream = await downloadResponse.Content.ReadAsStreamAsync();
+            using var memoryStream = new MemoryStream();
+            var buffer = new byte[81920];
+            int bytesRead;
+            long totalRead = 0;
+
+            while ((bytesRead = await downloadStream.ReadAsync(buffer)) > 0)
+            {
+                await memoryStream.WriteAsync(buffer.AsMemory(0, bytesRead));
+                totalRead += bytesRead;
+                if (totalBytes > 0)
+                {
+                    var percent = (int)(totalRead * 100 / totalBytes);
+                    var elapsed = (DateTime.Now - downloadStart).TotalSeconds;
+                    var speed = elapsed > 0 ? totalRead / 1024 / elapsed : 0;
+                    Console.Write($"\r  Downloading file: {fileName} ({totalBytes / 1024}KB) {percent}% @ {speed:F0}KB/s    ");
+                }
+            }
+
+            var downloadTime = (DateTime.Now - downloadStart).TotalSeconds;
+            var downloadSpeed = downloadTime > 0 ? totalRead / 1024 / downloadTime : 0;
+            Console.WriteLine($"\r  Downloaded file: {fileName} ({totalRead / 1024}KB) @ {downloadSpeed:F0}KB/s              ");
+
+            var fileBytes = memoryStream.ToArray();
+
+            // Upload to Ghost with progress
+            Console.Write($"  Uploading file: {fileName} ({fileBytes.Length / 1024}KB)");
+            var uploadStart = DateTime.Now;
+
+            var request = CreateRequest(HttpMethod.Post, "files/upload/");
+
+            using var content = new MultipartFormDataContent();
+            var fileContent = new ByteArrayContent(fileBytes);
+            fileContent.Headers.ContentType = new MediaTypeHeaderValue(GetMimeType(fileName));
+            content.Add(fileContent, "file", fileName);
+
+            request.Content = content;
+
+            var response = await _http.SendAsync(request);
+            var uploadTime = (DateTime.Now - uploadStart).TotalSeconds;
+            var uploadSpeed = uploadTime > 0 ? fileBytes.Length / 1024 / uploadTime : 0;
+
+            var json = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"\r  Upload failed: {fileName} - {json}                    ");
+                return null;
+            }
+
+            var result = JObject.Parse(json);
+            var uploadedUrl = result["files"]?[0]?["url"]?.ToString();
+            Console.WriteLine($"\r  Uploaded file: {fileName} ({fileBytes.Length / 1024}KB) @ {uploadSpeed:F0}KB/s              ");
+            return uploadedUrl;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\n  Error uploading file: {ex.Message}");
+            return null;
+        }
     }
 }
 
