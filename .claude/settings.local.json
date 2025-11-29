@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:holographica.space)",
+      "Bash(echo:*)",
+      "Bash(dotnet run)",
+      "WebSearch",
+      "WebFetch(domain:forum.ghost.org)",
+      "WebFetch(domain:ghost.org)",
+      "WebFetch(domain:docs.ghost.org)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

@@ -40,7 +40,8 @@ var ghostAuthorsDict = new Dictionary<string, GhostAuthor>(); // slug -> ghost a
 
 // await LoadLocalData();
 await DownloadAndSaveAllData();
-await ProcessPosts(20);
+// await ProcessPosts(20);
+await ProcessPosts(slug: "puzzling-places");
 await GenerateRedirects();
 
 // async Task LoadLocalData()
@@ -149,21 +150,37 @@ async Task DownloadAndSaveAllData()
     Console.WriteLine($"Saved {wpPosts.Count} WP posts, {ghostPosts.Count} Ghost posts, {ghostAuthors.Count} Ghost authors");
 }
 
-async Task ProcessPosts(int? count = null)
+async Task ProcessPosts(int? count = null, string? slug = null)
 {
     BuildLookupDictionaries();
     if (wpPosts == null) return;
 
-    var postsToProcess = wpPosts
-        .Where(p => ghostPosts?.Any(g => g.Slug == p.Slug) != true);
+    IEnumerable<Post> postsToProcess;
 
-    if (count.HasValue)
-        postsToProcess = postsToProcess.Take(count.Value);
+    if (!string.IsNullOrEmpty(slug))
+    {
+        // Process a specific post by slug
+        postsToProcess = wpPosts.Where(p => p.Slug == slug);
+    }
+    else
+    {
+        // Process posts not yet in Ghost
+        postsToProcess = wpPosts.Where(p => ghostPosts?.Any(g => g.Slug == p.Slug) != true);
+
+        if (count.HasValue)
+            postsToProcess = postsToProcess.Take(count.Value);
+    }
 
     var postsList = postsToProcess.ToList();
     var total = postsList.Count;
 
-    Console.WriteLine($"Processing {total} posts...");
+    if (total == 0)
+    {
+        Console.WriteLine(slug != null ? $"Post with slug '{slug}' not found" : "No posts to process");
+        return;
+    }
+
+    Console.WriteLine($"Processing {total} post(s)...");
 
     var processed = 0;
     foreach (var wpPost in postsList)
@@ -226,6 +243,7 @@ async Task GenerateRedirects()
 
 async Task MovePostToGhost(Post wpPost, string targetSlug)
 {
+    Console.WriteLine($"Raw: {wpPost.Content.Raw} \nRendered: {wpPost.Content.Rendered}");
     Console.WriteLine($"Creating post: {targetSlug}");
 
     // Convert WP tags to Ghost tags
@@ -328,7 +346,7 @@ async Task MovePostToGhost(Post wpPost, string targetSlug)
     content = ProcessTablePressTables(content);
 
     // Process videos in content
-    content = ProcessVideos(content);
+    content = await ProcessVideos(content, ghostClient);
 
     // Strip HTML tags from excerpt
     var excerpt = wpPost.Excerpt.Rendered;
@@ -358,13 +376,19 @@ async Task MovePostToGhost(Post wpPost, string targetSlug)
         }
     }
 
-    // Create Ghost post
+
+    // DO NOT apply HtmlDecode to entire content - it corrupts HTML comments like <!--kg-card-begin: video-->
+    // WordPress HTML entities (&#8217; etc.) in text will be handled by Ghost during import
+    // We only decode title and excerpt which are plain text
+    var decodedContent = content; // Keep HTML intact
+
+    // Create Ghost post - decode HTML entities in title, content and excerpt
     var ghostPost = new GhostPost
     {
-        Title = wpPost.Title.Rendered,
+        Title = System.Net.WebUtility.HtmlDecode(wpPost.Title.Rendered),
         Slug = targetSlug,
-        Html = content,
-        CustomExcerpt = excerpt,
+        Html = decodedContent,
+        CustomExcerpt = string.IsNullOrEmpty(excerpt) ? null : System.Net.WebUtility.HtmlDecode(excerpt),
         Status = wpPost.Status == Status.Publish ? "published" : "draft",
         PublishedAt = wpPost.Date,
         Tags = postTags,
@@ -377,76 +401,153 @@ async Task MovePostToGhost(Post wpPost, string targetSlug)
     {
         ghostPosts?.Add(created);
         Console.WriteLine($"Created: {created.Slug}");
+
     }
 }
 
-string ProcessVideos(string content)
+async Task<string> ProcessVideos(string content, GhostAdminClient client)
 {
     var doc = new HtmlDocument();
     doc.LoadHtml(content);
     var videosProcessed = 0;
+    var videoReplacements = new Dictionary<string, string>(); // placeholder -> actual HTML with comments
 
-    // Process YouTube links (various formats)
-    // Matches: youtube.com/watch?v=ID, youtu.be/ID, youtube.com/embed/ID
-    var youtubePattern = @"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})";
+    // Video URL patterns
+    const string youtubePattern = @"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})";
+    const string vimeoPattern = @"(?:https?://)?(?:www\.)?(?:vimeo\.com/|player\.vimeo\.com/video/)(\d+)";
+    const string videoFilePattern = @"(https?://[^\s<>""']+\.(?:mp4|webm|ogg|mov))";
 
-    // Process Vimeo links
-    // Matches: vimeo.com/ID, player.vimeo.com/video/ID
-    var vimeoPattern = @"(?:https?://)?(?:www\.)?(?:vimeo\.com/|player\.vimeo\.com/video/)(\d+)";
+    // NOTE: We do NOT convert anchor tags (<a href="video">) to embeds - those are just links
+    // Only process actual embedded video elements (shortcodes, iframes, video tags) below
 
-    // Process direct video file links
-    var videoFilePattern = @"(https?://[^\s<>""']+\.(?:mp4|webm|ogg|mov))";
+    // Process WordPress [video] shortcodes - e.g. [video mp4="url" ...][/video] or [video src="url" .../]
+    // WordPress uses format-specific attributes like mp4="...", webm="...", ogg="..." or generic src="..."
+    const string videoShortcodePattern = @"\[video\s+[^\]]*(?:mp4|webm|ogg|mov|src)=[""']([^""']+)[""'][^\]]*\](?:\[/video\])?";
+    var shortcodeMatches = Regex.Matches(content, videoShortcodePattern, RegexOptions.IgnoreCase);
 
-    // Find all anchor tags that link to videos
-    var anchorNodes = doc.DocumentNode.SelectNodes("//a[@href]");
-    foreach (var anchor in anchorNodes.ToList())
+    // Also process [embed] shortcodes - e.g. [embed]https://youtube.com/...[/embed]
+    const string embedShortcodePattern = @"\[embed\]([^\[]+)\[/embed\]";
+    var embedMatches = Regex.Matches(content, embedShortcodePattern, RegexOptions.IgnoreCase);
+    foreach (Match match in embedMatches)
     {
-        var href = anchor.GetAttributeValue("href", "");
-        if (string.IsNullOrEmpty(href)) continue;
+        var url = match.Groups[1].Value.Trim();
 
-        string? embedHtml = null;
-
-        // Check for YouTube
-        var youtubeMatch = Regex.Match(href, youtubePattern);
+        // Check if it's a YouTube URL
+        var youtubeMatch = Regex.Match(url, youtubePattern);
         if (youtubeMatch.Success)
         {
             var videoId = youtubeMatch.Groups[1].Value;
-            embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe width=""560"" height=""315"" src=""https://www.youtube.com/embed/{videoId}"" frameborder=""0"" allow=""accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"" allowfullscreen></iframe></figure>";
-        }
-
-        // Check for Vimeo
-        if (embedHtml == null)
-        {
-            var vimeoMatch = Regex.Match(href, vimeoPattern);
-            if (vimeoMatch.Success)
-            {
-                var videoId = vimeoMatch.Groups[1].Value;
-                embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe src=""https://player.vimeo.com/video/{videoId}"" width=""560"" height=""315"" frameborder=""0"" allow=""autoplay; fullscreen; picture-in-picture"" allowfullscreen></iframe></figure>";
-            }
-        }
-
-        // Check for direct video files
-        if (embedHtml == null)
-        {
-            var videoMatch = Regex.Match(href, videoFilePattern, RegexOptions.IgnoreCase);
-            if (videoMatch.Success)
-            {
-                var videoUrl = videoMatch.Groups[1].Value;
-                embedHtml = $@"<figure class=""kg-card kg-video-card""><video controls><source src=""{videoUrl}"" type=""video/{GetVideoMimeType(videoUrl)}"">Your browser does not support the video tag.</video></figure>";
-            }
-        }
-
-        if (embedHtml != null)
-        {
-            // Replace the anchor with the embed
-            var embedNode = HtmlNode.CreateNode(embedHtml);
-            anchor.ParentNode.ReplaceChild(embedNode, anchor);
+            var embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe width=""560"" height=""315"" src=""https://www.youtube.com/embed/{videoId}"" frameborder=""0"" allow=""accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"" allowfullscreen></iframe></figure>";
+            content = content.Replace(match.Value, embedHtml);
             videosProcessed++;
+            continue;
+        }
+
+        // Check if it's a Vimeo URL
+        var vimeoMatch = Regex.Match(url, vimeoPattern);
+        if (vimeoMatch.Success)
+        {
+            var videoId = vimeoMatch.Groups[1].Value;
+            var embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe src=""https://player.vimeo.com/video/{videoId}"" width=""560"" height=""315"" frameborder=""0"" allow=""autoplay; fullscreen; picture-in-picture"" allowfullscreen></iframe></figure>";
+            content = content.Replace(match.Value, embedHtml);
+            videosProcessed++;
+            continue;
+        }
+
+        // Check if it's a direct video file
+        var videoMatch = Regex.Match(url, videoFilePattern, RegexOptions.IgnoreCase);
+        if (videoMatch.Success)
+        {
+            var uploadedUrl = await client.UploadVideoAsync(url);
+            if (!string.IsNullOrEmpty(uploadedUrl))
+            {
+                // Use Ghost's HTML card to preserve the video tag
+                var embedHtml = $@"<!--kg-card-begin: html-->
+<div class=""video-container"" style=""position:relative;padding-bottom:56.25%;height:0;overflow:hidden;max-width:100%"">
+<video controls style=""position:absolute;top:0;left:0;width:100%;height:100%"" preload=""metadata"">
+<source src=""{uploadedUrl}"" type=""video/mp4"">
+Your browser does not support the video tag.
+</video>
+</div>
+<!--kg-card-end: html-->";
+                content = content.Replace(match.Value, embedHtml);
+                videosProcessed++;
+            }
         }
     }
+    foreach (Match match in shortcodeMatches)
+    {
+        var videoUrl = match.Groups[1].Value;
+        var uploadedUrl = await client.UploadVideoAsync(videoUrl);
+        if (string.IsNullOrEmpty(uploadedUrl)) continue;
+        // Use Ghost's HTML card to preserve the video tag
+        var embedHtml = $@"<!--kg-card-begin: html-->
+<div class=""video-container"" style=""position:relative;padding-bottom:56.25%;height:0;overflow:hidden;max-width:100%"">
+<video controls style=""position:absolute;top:0;left:0;width:100%;height:100%"" preload=""metadata"">
+<source src=""{uploadedUrl}"" type=""video/mp4"">
+Your browser does not support the video tag.
+</video>
+</div>
+<!--kg-card-end: html-->";
+        content = content.Replace(match.Value, embedHtml);
+        videosProcessed++;
+    }
 
-    // Also process existing iframes that might need fixing (YouTube/Vimeo embeds from WordPress)
+    // Reload doc after shortcode processing
+    doc.LoadHtml(content);
+
+    // Process existing <video> tags - upload source to Ghost
+    var videoNodes = doc.DocumentNode.SelectNodes("//video");
+    if (videoNodes != null)
+    foreach (var video in videoNodes.ToList())
+    {
+        // Get video source - either from src attribute or from <source> child
+        var src = video.GetAttributeValue("src", "");
+        if (string.IsNullOrEmpty(src))
+        {
+            var sourceNode = video.SelectSingleNode(".//source[@src]");
+            src = sourceNode?.GetAttributeValue("src", "") ?? "";
+        }
+
+        if (string.IsNullOrEmpty(src)) continue;
+
+        // Upload to Ghost
+        var uploadedUrl = await client.UploadVideoAsync(src);
+        if (string.IsNullOrEmpty(uploadedUrl)) continue;
+
+        // Ghost seems to strip video tags from HTML content. Try using an HTML embed card with iframe-like structure.
+        // This uses a raw HTML block that Ghost should preserve.
+        var placeholder = $"__VIDEO_PLACEHOLDER_{videosProcessed}__";
+        // Use an iframe with video - this might be preserved better than raw video tag
+        var embedHtml = $@"<!--kg-card-begin: html-->
+<div class=""video-container"" style=""position:relative;padding-bottom:56.25%;height:0;overflow:hidden;max-width:100%"">
+<video controls style=""position:absolute;top:0;left:0;width:100%;height:100%"" preload=""metadata"">
+<source src=""{uploadedUrl}"" type=""video/mp4"">
+Your browser does not support the video tag.
+</video>
+</div>
+<!--kg-card-end: html-->";
+
+        // Replace video or its parent figure with a placeholder span
+        var placeholderNode = HtmlNode.CreateNode($"<span>{placeholder}</span>");
+        var parent = video.ParentNode;
+        if (parent.Name == "figure")
+        {
+            parent.ParentNode.ReplaceChild(placeholderNode, parent);
+        }
+        else
+        {
+            parent.ReplaceChild(placeholderNode, video);
+        }
+
+        // Store for later replacement in the final HTML string
+        videoReplacements[placeholder] = embedHtml;
+        videosProcessed++;
+    }
+
+    // Process existing iframes (YouTube/Vimeo embeds from WordPress)
     var iframeNodes = doc.DocumentNode.SelectNodes("//iframe[@src]");
+    if (iframeNodes != null)
     foreach (var iframe in iframeNodes.ToList())
     {
         var src = iframe.GetAttributeValue("src", "");
@@ -454,79 +555,27 @@ string ProcessVideos(string content)
 
         // Ensure iframes are wrapped in figure tags for Ghost
         var parent = iframe.ParentNode;
-        if (parent.Name != "figure")
-        {
-            var figureHtml = $@"<figure class=""kg-card kg-embed-card"">{iframe.OuterHtml}</figure>";
-            var figureNode = HtmlNode.CreateNode(figureHtml);
-            parent.ReplaceChild(figureNode, iframe);
-            videosProcessed++;
-        }
+        if (parent.Name == "figure") continue;
+        var figureHtml = $"""<figure class="kg-card kg-embed-card">{iframe.OuterHtml}</figure>""";
+        var figureNode = HtmlNode.CreateNode(figureHtml);
+        parent.ReplaceChild(figureNode, iframe);
+        videosProcessed++;
     }
 
-    // Process plain text URLs that are YouTube/Vimeo links (not inside anchors)
-    var textNodes = doc.DocumentNode.SelectNodes("//text()[not(ancestor::a) and not(ancestor::script) and not(ancestor::style)]");
-    foreach (var textNode in textNodes.ToList())
-    {
-        var text = textNode.InnerText;
-        var modified = false;
-
-        // Replace YouTube URLs
-        var youtubeMatches = Regex.Matches(text, youtubePattern);
-        foreach (Match match in youtubeMatches)
-        {
-            var videoId = match.Groups[1].Value;
-            var embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe width=""560"" height=""315"" src=""https://www.youtube.com/embed/{videoId}"" frameborder=""0"" allow=""accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"" allowfullscreen></iframe></figure>";
-            text = text.Replace(match.Value, embedHtml);
-            modified = true;
-            videosProcessed++;
-        }
-
-        // Replace Vimeo URLs
-        var vimeoMatches = Regex.Matches(text, vimeoPattern);
-        foreach (Match match in vimeoMatches)
-        {
-            var videoId = match.Groups[1].Value;
-            var embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe src=""https://player.vimeo.com/video/{videoId}"" width=""560"" height=""315"" frameborder=""0"" allow=""autoplay; fullscreen; picture-in-picture"" allowfullscreen></iframe></figure>";
-            text = text.Replace(match.Value, embedHtml);
-            modified = true;
-            videosProcessed++;
-        }
-
-        // Replace direct video file URLs
-        var videoMatches = Regex.Matches(text, videoFilePattern, RegexOptions.IgnoreCase);
-        foreach (Match match in videoMatches)
-        {
-            var videoUrl = match.Groups[1].Value;
-            var embedHtml = $@"<figure class=""kg-card kg-video-card""><video controls><source src=""{videoUrl}"" type=""video/{GetVideoMimeType(videoUrl)}"">Your browser does not support the video tag.</video></figure>";
-            text = text.Replace(match.Value, embedHtml);
-            modified = true;
-            videosProcessed++;
-        }
-
-        if (modified)
-        {
-            var newNode = HtmlNode.CreateNode($"<span>{text}</span>");
-            textNode.ParentNode.ReplaceChild(newNode, textNode);
-        }
-    }
+    // NOTE: We do NOT process plain text URLs - if someone wrote a URL as plain text, keep it as-is
+    // Only actual embedded elements (iframes, video tags) are processed above
 
     if (videosProcessed > 0)
         Console.WriteLine($"  Processed {videosProcessed} video(s)");
 
-    return doc.DocumentNode.OuterHtml;
-}
-
-string GetVideoMimeType(string url)
-{
-    var ext = Path.GetExtension(url).ToLower();
-    return ext switch
+    // Get the final HTML and replace placeholders with actual video HTML (including comments)
+    var result = doc.DocumentNode.OuterHtml;
+    foreach (var (placeholder, videoHtml) in videoReplacements)
     {
-        ".mp4" => "mp4",
-        ".webm" => "webm",
-        ".ogg" => "ogg",
-        ".mov" => "quicktime",
-        _ => "mp4"
-    };
+        result = result.Replace($"<span>{placeholder}</span>", videoHtml);
+    }
+
+    return result;
 }
 
 async Task<string> ProcessFileLinks(string content, GhostAdminClient client)
@@ -536,10 +585,12 @@ async Task<string> ProcessFileLinks(string content, GhostAdminClient client)
     var filesProcessed = 0;
 
     // Pattern to match internal WordPress storage URLs
-    var internalStoragePattern = @"https?://holographica\.space/wp-content/uploads/[^\s""'<>]+";
+    const string internalStoragePattern = @"https?://holographica\.space/wp-content/uploads/[^\s""'<>]+";
 
     // Find all anchor tags that link to internal files
-    var anchorNodes = doc.DocumentNode.SelectNodes("//a[@href]");
+    // IMPORTANT: Skip anchors inside <video> elements (they are fallback content, not real links)
+    var anchorNodes = doc.DocumentNode.SelectNodes("//a[@href][not(ancestor::video)]");
+    if (anchorNodes != null)
     foreach (var anchor in anchorNodes.ToList())
     {
         var href = anchor.GetAttributeValue("href", "");
@@ -548,9 +599,12 @@ async Task<string> ProcessFileLinks(string content, GhostAdminClient client)
         // Check if this is an internal storage link (not an image - those are handled separately)
         if (Regex.IsMatch(href, internalStoragePattern, RegexOptions.IgnoreCase))
         {
-            var ext = Path.GetExtension(href).ToLower();
+            var ext = Path.GetExtension(href).TrimEnd('?', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '=', '_').ToLower();
             // Skip image files - they're handled by the image processor
             if (ext is ".jpg" or ".jpeg" or ".png" or ".gif" or ".webp" or ".svg")
+                continue;
+            // Skip video files - they're handled by the video processor
+            if (ext is ".mp4" or ".webm" or ".ogg" or ".mov")
                 continue;
 
             try
@@ -577,26 +631,21 @@ async Task<string> ProcessFileLinks(string content, GhostAdminClient client)
 
 string ProcessTablePressTables(string content)
 {
-    var doc = new HtmlDocument();
-    doc.LoadHtml(content);
-    var tablesProcessed = 0;
-
-    // TablePress uses various container structures:
-    // - <div class="tablepress-scroll-wrapper">
-    // - <table class="tablepress tablepress-id-X">
-    // Also handle shortcode remnants like [table id=X /] or [tablepress id=X /]
-
     // First, replace any remaining TablePress shortcodes with empty string (they won't render anyway)
     content = Regex.Replace(content, @"\[table\s+id=[^\]]+\s*/?\]", "", RegexOptions.IgnoreCase);
     content = Regex.Replace(content, @"\[tablepress\s+id=[^\]]+\s*/?\]", "", RegexOptions.IgnoreCase);
     content = Regex.Replace(content, @"\[/table\]", "", RegexOptions.IgnoreCase);
     content = Regex.Replace(content, @"\[/tablepress\]", "", RegexOptions.IgnoreCase);
 
-    // Reload after shortcode removal
+    var doc = new HtmlDocument();
     doc.LoadHtml(content);
+    var tablesProcessed = 0;
 
     // Find all TablePress tables
     var tablePressNodes = doc.DocumentNode.SelectNodes("//table[contains(@class, 'tablepress')]");
+    if (tablePressNodes == null)
+        return doc.DocumentNode.OuterHtml;
+
     foreach (var table in tablePressNodes.ToList())
     {
         // Create a clean Ghost-compatible table
@@ -604,18 +653,20 @@ string ProcessTablePressTables(string content)
 
         // Process thead if exists
         var thead = table.SelectSingleNode(".//thead");
+        if (thead != null)
         {
             var newThead = doc.CreateElement("thead");
             var headerRows = thead.SelectNodes(".//tr");
+            if (headerRows != null)
             foreach (var row in headerRows)
             {
                 var newRow = doc.CreateElement("tr");
                 var cells = row.SelectNodes(".//th|.//td");
+                if (cells != null)
                 foreach (var cell in cells)
                 {
                     var newCell = doc.CreateElement("th");
                     newCell.InnerHtml = cell.InnerHtml.Trim();
-                    // Preserve colspan/rowspan if present
                     var colspan = cell.GetAttributeValue("colspan", "");
                     var rowspan = cell.GetAttributeValue("rowspan", "");
                     if (!string.IsNullOrEmpty(colspan)) newCell.SetAttributeValue("colspan", colspan);
@@ -629,18 +680,20 @@ string ProcessTablePressTables(string content)
 
         // Process tbody
         var tbody = table.SelectSingleNode(".//tbody");
+        if (tbody != null)
         {
             var newTbody = doc.CreateElement("tbody");
             var bodyRows = tbody.SelectNodes(".//tr");
+            if (bodyRows != null)
             foreach (var row in bodyRows)
             {
                 var newRow = doc.CreateElement("tr");
                 var cells = row.SelectNodes(".//td|.//th");
+                if (cells != null)
                 foreach (var cell in cells)
                 {
                     var newCell = doc.CreateElement("td");
                     newCell.InnerHtml = cell.InnerHtml.Trim();
-                    // Preserve colspan/rowspan if present
                     var colspan = cell.GetAttributeValue("colspan", "");
                     var rowspan = cell.GetAttributeValue("rowspan", "");
                     if (!string.IsNullOrEmpty(colspan)) newCell.SetAttributeValue("colspan", colspan);
@@ -654,13 +707,16 @@ string ProcessTablePressTables(string content)
 
         // Process tfoot if exists
         var tfoot = table.SelectSingleNode(".//tfoot");
+        if (tfoot != null)
         {
             var newTfoot = doc.CreateElement("tfoot");
             var footerRows = tfoot.SelectNodes(".//tr");
+            if (footerRows != null)
             foreach (var row in footerRows)
             {
                 var newRow = doc.CreateElement("tr");
                 var cells = row.SelectNodes(".//td|.//th");
+                if (cells != null)
                 foreach (var cell in cells)
                 {
                     var newCell = doc.CreateElement("td");
@@ -678,31 +734,31 @@ string ProcessTablePressTables(string content)
 
         // Find the wrapper div if it exists and replace the whole thing
         var parent = table.ParentNode;
-        if (parent.Name == "div" &&
+        if (parent != null && parent.Name == "div" &&
             (parent.GetAttributeValue("class", "").Contains("tablepress") ||
              parent.GetAttributeValue("class", "").Contains("tablepress-scroll-wrapper")))
         {
             // Replace the wrapper div with the clean table
-            parent.ParentNode.ReplaceChild(newTable, parent);
+            parent.ParentNode?.ReplaceChild(newTable, parent);
         }
         else
         {
             // Just replace the table
-            parent.ReplaceChild(newTable, table);
+            parent?.ReplaceChild(newTable, table);
         }
 
         tablesProcessed++;
     }
 
     // Also clean up any empty TablePress wrapper divs that might remain
-    doc = new HtmlDocument();
-    doc.LoadHtml(doc.DocumentNode.OuterHtml);
     var wrapperDivs = doc.DocumentNode.SelectNodes("//div[contains(@class, 'tablepress-scroll-wrapper')]");
+    if (wrapperDivs != null)
     foreach (var wrapper in wrapperDivs.ToList())
     {
         // If it just contains a table, unwrap it
         var innerTable = wrapper.SelectSingleNode(".//table");
-        wrapper.ParentNode.ReplaceChild(innerTable, wrapper);
+        if (innerTable != null)
+            wrapper.ParentNode?.ReplaceChild(innerTable, wrapper);
     }
 
     if (tablesProcessed > 0)
@@ -980,8 +1036,91 @@ public class GhostAdminClient
             ".rar" => "application/vnd.rar",
             ".txt" => "text/plain",
             ".csv" => "text/csv",
+            ".mp4" => "video/mp4",
+            ".webm" => "video/webm",
+            ".ogg" => "video/ogg",
+            ".mov" => "video/quicktime",
             _ => "application/octet-stream"
         };
+    }
+
+    [SuppressMessage("ReSharper", "PossibleLossOfFraction")]
+    public async Task<string?> UploadVideoAsync(string videoUrl)
+    {
+        try
+        {
+            var fileName = Path.GetFileName(new Uri(videoUrl).LocalPath);
+            fileName = Regex.Replace(fileName, @"[^\u0000-\u007F]+", "");
+            if (fileName.Length > 100) fileName = fileName[..100] + Path.GetExtension(fileName);
+
+            // Download video with progress
+            Console.Write($"  Downloading video: {fileName}");
+            var downloadStart = DateTime.Now;
+
+            using var downloadResponse = await _http.GetAsync(videoUrl, HttpCompletionOption.ResponseHeadersRead);
+            var totalBytes = downloadResponse.Content.Headers.ContentLength ?? 0;
+            Console.Write($" ({totalBytes / 1024}KB)");
+
+            await using var downloadStream = await downloadResponse.Content.ReadAsStreamAsync();
+            using var memoryStream = new MemoryStream();
+            var buffer = new byte[81920];
+            int bytesRead;
+            long totalRead = 0;
+
+            while ((bytesRead = await downloadStream.ReadAsync(buffer)) > 0)
+            {
+                await memoryStream.WriteAsync(buffer.AsMemory(0, bytesRead));
+                totalRead += bytesRead;
+                if (totalBytes > 0)
+                {
+                    var percent = (int)(totalRead * 100 / totalBytes);
+                    var elapsed = (DateTime.Now - downloadStart).TotalSeconds;
+                    var speed = elapsed > 0 ? totalRead / 1024 / elapsed : 0;
+                    Console.Write($"\r  Downloading video: {fileName} ({totalBytes / 1024}KB) {percent}% @ {speed:F0}KB/s    ");
+                }
+            }
+
+            var downloadTime = (DateTime.Now - downloadStart).TotalSeconds;
+            var downloadSpeed = downloadTime > 0 ? totalRead / 1024 / downloadTime : 0;
+            Console.WriteLine($"\r  Downloaded video: {fileName} ({totalRead / 1024}KB) @ {downloadSpeed:F0}KB/s              ");
+
+            var videoBytes = memoryStream.ToArray();
+
+            // Upload to Ghost media endpoint
+            Console.Write($"  Uploading video: {fileName} ({videoBytes.Length / 1024}KB)");
+            var uploadStart = DateTime.Now;
+
+            var request = CreateRequest(HttpMethod.Post, "media/upload/");
+
+            using var content = new MultipartFormDataContent();
+            var fileContent = new ByteArrayContent(videoBytes);
+            fileContent.Headers.ContentType = new MediaTypeHeaderValue(GetMimeType(fileName));
+            content.Add(fileContent, "file", fileName);
+
+            request.Content = content;
+
+            var response = await _http.SendAsync(request);
+            var uploadTime = (DateTime.Now - uploadStart).TotalSeconds;
+            var uploadSpeed = uploadTime > 0 ? videoBytes.Length / 1024 / uploadTime : 0;
+
+            var json = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"\r  Upload failed: {fileName} - {json}                    ");
+                return null;
+            }
+
+            var result = JObject.Parse(json);
+            var uploadedUrl = result["media"]?[0]?["url"]?.ToString();
+            Console.WriteLine($"\r  Uploaded video: {fileName} ({videoBytes.Length / 1024}KB) @ {uploadSpeed:F0}KB/s              ");
+            return uploadedUrl;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\n  Error uploading video: {ex.Message}");
+            return null;
+        }
     }
 
     [SuppressMessage("ReSharper", "PossibleLossOfFraction")]
