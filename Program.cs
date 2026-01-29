@@ -40,8 +40,8 @@ var ghostAuthorsDict = new Dictionary<string, GhostAuthor>(); // slug -> ghost a
 
 // await LoadLocalData();
 await DownloadAndSaveAllData();
-// await ProcessPosts(20);
-await ProcessPosts(slug: "puzzling-places");
+await ProcessPosts();
+// await ProcessPosts(slug: "puzzling-places");
 await GenerateRedirects();
 
 // async Task LoadLocalData()
@@ -293,7 +293,7 @@ async Task MovePostToGhost(Post wpPost, string targetSlug)
 
     html.LoadHtml(content);
     var imgNodes = html.DocumentNode.SelectNodes("//img");
-    foreach (var imgNode in imgNodes)
+    foreach (var imgNode in imgNodes ?? Enumerable.Empty<HtmlNode>())
     {
         var src = imgNode.GetAttributeValue("src", string.Empty);
         if (string.IsNullOrEmpty(src)) continue;
@@ -327,6 +327,7 @@ async Task MovePostToGhost(Post wpPost, string targetSlug)
     {
         html.LoadHtml(content);
         var featureImgNode = html.DocumentNode.SelectSingleNode($"//img[@src='{featureImageSrc}']");
+        if (featureImgNode != null)
         {
             // Remove the img tag and its parent if it's a figure or empty p/div
             var parent = featureImgNode.ParentNode;
@@ -820,6 +821,24 @@ public class GhostAdminClient
         return request;
     }
 
+    private async Task<T?> RetryAsync<T>(Func<Task<T?>> action, int maxRetries = 3, string? context = null)
+    {
+        for (var attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            try
+            {
+                return await action();
+            }
+            catch (HttpRequestException ex) when (attempt < maxRetries)
+            {
+                var delay = attempt * 2; // 2s, 4s, 6s
+                Console.WriteLine($"  Network error{(context != null ? $" ({context})" : "")}: {ex.Message}. Retrying in {delay}s... (attempt {attempt}/{maxRetries})");
+                await Task.Delay(TimeSpan.FromSeconds(delay));
+            }
+        }
+        return default;
+    }
+
     public async Task<List<GhostPost>> GetAllPostsAsync()
     {
         var posts = new List<GhostPost>();
@@ -867,21 +886,24 @@ public class GhostAdminClient
 
     public async Task<GhostTag?> CreateTagAsync(string slug, string name)
     {
-        var request = CreateRequest(HttpMethod.Post, "tags/");
-        var payload = new { tags = new[] { new { slug, name } } };
-        request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
-
-        var response = await _http.SendAsync(request);
-        var json = await response.Content.ReadAsStringAsync();
-
-        if (!response.IsSuccessStatusCode)
+        return await RetryAsync(async () =>
         {
-            Console.WriteLine($"Error creating tag {slug}: {json}");
-            return null;
-        }
+            var request = CreateRequest(HttpMethod.Post, "tags/");
+            var payload = new { tags = new[] { new { slug, name } } };
+            request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
 
-        var result = JObject.Parse(json);
-        return result["tags"]?[0]?.ToObject<GhostTag>();
+            var response = await _http.SendAsync(request);
+            var json = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"Error creating tag {slug}: {json}");
+                return null;
+            }
+
+            var result = JObject.Parse(json);
+            return result["tags"]?[0]?.ToObject<GhostTag>();
+        }, context: $"creating tag {slug}");
     }
 
     public async Task<List<GhostAuthor>> GetAllAuthorsAsync()
@@ -902,8 +924,6 @@ public class GhostAdminClient
 
     public async Task<GhostPost?> CreatePostAsync(GhostPost post)
     {
-        var request = CreateRequest(HttpMethod.Post, "posts/?source=html");
-
         // Truncate excerpt to 300 chars max
         var excerpt = post.CustomExcerpt;
         if (excerpt?.Length > 300)
@@ -922,20 +942,24 @@ public class GhostAdminClient
             ["authors"] = post.Authors?.Select(a => new { id = a.Id }).ToArray()
         };
 
-        var payload = new { posts = new[] { postData } };
-        request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
-
-        var response = await _http.SendAsync(request);
-        var json = await response.Content.ReadAsStringAsync();
-
-        if (!response.IsSuccessStatusCode)
+        return await RetryAsync(async () =>
         {
-            Console.WriteLine($"Error creating post {post.Slug}: {json}");
-            return null;
-        }
+            var request = CreateRequest(HttpMethod.Post, "posts/?source=html");
+            var payload = new { posts = new[] { postData } };
+            request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
 
-        var result = JObject.Parse(json);
-        return result["posts"]?[0]?.ToObject<GhostPost>();
+            var response = await _http.SendAsync(request);
+            var json = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"Error creating post {post.Slug}: {json}");
+                return null;
+            }
+
+            var result = JObject.Parse(json);
+            return result["posts"]?[0]?.ToObject<GhostPost>();
+        }, context: $"creating post {post.Slug}");
     }
 
     [SuppressMessage("ReSharper", "PossibleLossOfFraction")]
