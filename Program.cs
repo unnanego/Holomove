@@ -13,7 +13,7 @@ using WordPressPCL.Models;
 // CONFIGURATION
 // =============================================================================
 
-const string dataFolder = @"C:\Users\unnanego\Desktop\downloads";
+var dataFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "downloads");
 Directory.CreateDirectory(dataFolder);
 
 // Source WordPress (read-only, no auth needed)
@@ -68,7 +68,7 @@ var mediaCache = new Dictionary<string, MediaCacheItem>();
 await AuthenticateTargetWp();
 await LoadCache();
 await DownloadNewData();
-await ProcessPosts();
+await ProcessPosts(1);
 await SaveCache();
 await GenerateRedirects();
 
@@ -481,7 +481,7 @@ async Task MigratePost(Post sourcePost)
     content = CleanupHtml(content);
 
     // 4. Map author
-    int authorId = 1; // Default to admin
+    var authorId = 1; // Default to admin
     if (sourceUsersDict.TryGetValue(sourcePost.Author, out var sourceAuthor))
     {
         var targetAuthor = targetAuthorsDict.Values.FirstOrDefault(a =>
@@ -529,8 +529,9 @@ async Task MigratePost(Post sourcePost)
     Console.WriteLine($"  Created post ID: {createdPost.Id}");
 
     // 9. Update custom fields on target post
-    if (customMeta != null && customMeta.Count > 0)
+    if (customMeta is { Count: > 0 })
     {
+        Console.WriteLine($"  Custom fields: {string.Join(", ", customMeta.Keys)}");
         await UpdatePostMeta(createdPost.Id, customMeta);
         Console.WriteLine($"  Updated {customMeta.Count} custom field(s)");
     }
@@ -598,7 +599,7 @@ async Task<string> ProcessContentMedia(string content)
     doc.LoadHtml(content);
 
     // Process images
-    foreach (var img in doc.DocumentNode.SelectNodes("//img[@src]") ?? Enumerable.Empty<HtmlNode>())
+    foreach (var img in doc.DocumentNode.SelectNodes("//img[@src]"))
     {
         var src = img.GetAttributeValue("src", "");
         if (string.IsNullOrEmpty(src) || !IsSourceMedia(src)) continue;
@@ -611,7 +612,7 @@ async Task<string> ProcessContentMedia(string content)
     }
 
     // Process video sources
-    foreach (var source in doc.DocumentNode.SelectNodes("//video//source[@src] | //video[@src]") ?? Enumerable.Empty<HtmlNode>())
+    foreach (var source in doc.DocumentNode.SelectNodes("//video//source[@src] | //video[@src]"))
     {
         var src = source.GetAttributeValue("src", "");
         if (string.IsNullOrEmpty(src) || !IsSourceMedia(src)) continue;
@@ -631,13 +632,11 @@ async Task<string> ProcessContentMedia(string content)
 
         // Check if it's a document/file (not image/video which are handled above)
         var ext = Path.GetExtension(href).ToLower().Split('?')[0];
-        if (ext is ".pdf" or ".doc" or ".docx" or ".xls" or ".xlsx" or ".ppt" or ".pptx" or ".zip" or ".rar")
+        if (ext is not (".pdf" or ".doc" or ".docx" or ".xls" or ".xlsx" or ".ppt" or ".pptx" or ".zip" or ".rar")) continue;
+        var uploaded = await UploadMedia(href);
+        if (uploaded != null)
         {
-            var uploaded = await UploadMedia(href);
-            if (uploaded != null)
-            {
-                anchor.SetAttributeValue("href", uploaded.SourceUrl);
-            }
+            anchor.SetAttributeValue("href", uploaded.SourceUrl);
         }
     }
 
@@ -694,11 +693,9 @@ async Task<MediaItem?> UploadMedia(string sourceUrl)
             await memoryStream.WriteAsync(buffer.AsMemory(0, bytesRead));
             totalRead += bytesRead;
 
-            if (totalBytes > 0 && sw.ElapsedMilliseconds > 500)
-            {
-                var pct = totalRead * 100 / totalBytes;
-                Console.Write($"\r  Downloading: {fileName}... {pct}%   ");
-            }
+            if (totalBytes <= 0 || sw.ElapsedMilliseconds <= 500) continue;
+            var pct = totalRead * 100 / totalBytes;
+            Console.Write($"\r  Downloading: {fileName}... {pct}%   ");
         }
 
         var mediaBytes = memoryStream.ToArray();
@@ -810,7 +807,7 @@ string CleanupHtml(string content)
     doc.LoadHtml(content);
 
     // Clean up TablePress tables
-    foreach (var table in doc.DocumentNode.SelectNodes("//table[contains(@class, 'tablepress')]") ?? Enumerable.Empty<HtmlNode>())
+    foreach (var table in doc.DocumentNode.SelectNodes("//table[contains(@class, 'tablepress')]"))
     {
         // Remove TablePress-specific classes but keep the table
         var currentClass = table.GetAttributeValue("class", "");
@@ -832,15 +829,15 @@ string CleanupHtml(string content)
     }
 
     // Remove TablePress wrapper divs
-    foreach (var wrapper in (doc.DocumentNode.SelectNodes("//div[contains(@class, 'tablepress-scroll-wrapper')]") ?? Enumerable.Empty<HtmlNode>()).ToList())
+    foreach (var wrapper in (doc.DocumentNode.SelectNodes("//div[contains(@class, 'tablepress-scroll-wrapper')]")).ToList())
     {
         var innerContent = wrapper.InnerHtml;
         var textNode = HtmlNode.CreateNode(innerContent);
-        wrapper.ParentNode?.ReplaceChild(textNode, wrapper);
+        wrapper.ParentNode.ReplaceChild(textNode, wrapper);
     }
 
     // Wrap standalone iframes in figure tags
-    foreach (var iframe in (doc.DocumentNode.SelectNodes("//iframe[not(ancestor::figure)]") ?? Enumerable.Empty<HtmlNode>()).ToList())
+    foreach (var iframe in (doc.DocumentNode.SelectNodes("//iframe[not(ancestor::figure)]")).ToList())
     {
         var figure = doc.CreateElement("figure");
         figure.SetAttributeValue("class", "wp-block-embed");
@@ -906,19 +903,17 @@ public class MediaItem
 
 public class MediaCacheItem
 {
-    public int Id { get; set; }
-    public string Url { get; set; } = "";
+    public int Id { get; init; }
+    public string Url { get; init; } = "";
 }
 
 // =============================================================================
 // HTTP RETRY HANDLER
 // =============================================================================
 
-public class RetryHandler : DelegatingHandler
+public class RetryHandler(HttpMessageHandler innerHandler) : DelegatingHandler(innerHandler)
 {
-    public int MaxRetries { get; set; } = 3;
-
-    public RetryHandler(HttpMessageHandler innerHandler) : base(innerHandler) { }
+    public int MaxRetries { get; init; } = 3;
 
     protected override async Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request,
@@ -938,17 +933,10 @@ public class RetryHandler : DelegatingHandler
                     return response;
 
                 // Retry on server errors (5xx) and rate limiting (429)
-                if ((int)response.StatusCode >= 500 || response.StatusCode == HttpStatusCode.TooManyRequests)
-                {
-                    if (i < MaxRetries)
-                    {
-                        var delay = (i + 1) * 2000; // 2s, 4s, 6s
-                        await Task.Delay(delay, cancellationToken);
-                        continue;
-                    }
-                }
-
-                return response;
+                if ((int)response.StatusCode < 500 && response.StatusCode != HttpStatusCode.TooManyRequests) return response;
+                if (i >= MaxRetries) return response;
+                var delay = (i + 1) * 2000; // 2s, 4s, 6s
+                await Task.Delay(delay, cancellationToken);
             }
             catch (HttpRequestException) when (i < MaxRetries)
             {
