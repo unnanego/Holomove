@@ -500,10 +500,25 @@ async Task MigratePost(Post sourcePost)
         }
     }
 
-    // 6. Get custom fields (meta) from source post - only post_views and thumbnail
+    // 5. Upload featured image
+    int? featuredMediaId = null;
+    if (sourcePost.FeaturedMedia > 0)
+    {
+        var featuredUrl = await GetMediaUrl(sourcePost.FeaturedMedia.Value);
+        if (featuredUrl != null)
+        {
+            var uploaded = await UploadMedia(featuredUrl);
+            if (uploaded != null)
+            {
+                featuredMediaId = uploaded.Id;
+            }
+        }
+    }
+
+    // 6. Get custom fields (meta) from source post - only post_views
     var allMeta = await GetPostMeta(sourcePost.Id);
     var customMeta = allMeta?
-        .Where(kv => kv.Key.StartsWith("post_view") || kv.Key == "_thumbnail_id")
+        .Where(kv => kv.Key.StartsWith("post_view"))
         .ToDictionary(kv => kv.Key, kv => kv.Value);
 
     // 7. Prepare excerpt
@@ -526,7 +541,8 @@ async Task MigratePost(Post sourcePost)
         Date = sourcePost.Date,
         Tags = tagIds,
         Categories = categoryIds,
-        Author = authorId
+        Author = authorId,
+        FeaturedMedia = featuredMediaId
     };
 
     var createdPost = await targetWp.Posts.CreateAsync(newPost);
@@ -649,6 +665,24 @@ async Task<string> ProcessContentMedia(string content)
 bool IsSourceMedia(string url)
 {
     return url.Contains(sourceWpUrl) || url.Contains("holographica.space/wp-content/uploads");
+}
+
+async Task<string?> GetMediaUrl(int mediaId)
+{
+    try
+    {
+        var url = $"{sourceWpApiUrl}wp/v2/media/{mediaId}?_fields=source_url";
+        var response = await httpClient.GetAsync(url);
+        if (!response.IsSuccessStatusCode) return null;
+
+        var json = await response.Content.ReadAsStringAsync();
+        var result = JObject.Parse(json);
+        return result["source_url"]?.ToString();
+    }
+    catch
+    {
+        return null;
+    }
 }
 
 [SuppressMessage("ReSharper", "PossibleLossOfFraction")]
