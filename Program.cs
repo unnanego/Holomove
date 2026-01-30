@@ -1,232 +1,879 @@
 using System.Diagnostics.CodeAnalysis;
-using System.IdentityModel.Tokens.Jwt;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.RegularExpressions;
 using HtmlAgilityPack;
-using Microsoft.IdentityModel.Tokens;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using WordPressPCL;
 using WordPressPCL.Models;
 
-var html = new HtmlDocument();
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
 
-// Data files location
 const string dataFolder = @"C:\Users\unnanego\Desktop\downloads";
 Directory.CreateDirectory(dataFolder);
 
-// Source: WordPress
-var wp = new WordPressClient("https://holographica.space/wp-json/");
-// Target: Ghost at new.holographica.space
-const string ghostUrl = "https://new.holographica.space";
-const string ghostAdminApiKey = "69288e148eb69d0351ab7933:0f24e27f99e1af24e71a4817d8783636f9b808301cb99896c640a435ec0a03c4"; // Format: {id}:{secret} - Get from Ghost Admin > Settings > Integrations
+// Source WordPress (read-only, no auth needed)
+const string sourceWpUrl = "https://holographica.space";
+const string sourceWpApiUrl = $"{sourceWpUrl}/wp-json/";
 
-// Ghost API client setup
-var ghostClient = new GhostAdminClient(ghostUrl, ghostAdminApiKey);
+// Target WordPress (needs JWT authentication)
+const string targetWpUrl = "https://new.holographica.space";
+const string targetWpApiUrl = $"{targetWpUrl}/wp-json/";
+const string targetWpUsername = "unnanego";
+const string targetWpPassword = "cezmx6#DBjJrjL#rOy";
 
-List<Post>? wpPosts = null;
-List<Tag>? wpTags = null;
-List<User>? wpAuthors = null;
-List<Category>? wpCategories = null;
-List<GhostPost>? ghostPosts = null;
-List<GhostTag>? ghostTags = null;
-List<GhostAuthor>? ghostAuthors = null;
+// =============================================================================
+// INITIALIZATION
+// =============================================================================
 
-var wpTagsDict = new Dictionary<int, string>();
-var wpUsersDict = new Dictionary<int, User>();
-var ghostTagsDict = new Dictionary<string, string>(); // slug -> ghost id
-var ghostAuthorsDict = new Dictionary<string, GhostAuthor>(); // slug -> ghost author
+var sourceWp = new WordPressClient(sourceWpApiUrl);
+var targetWp = new WordPressClient(targetWpApiUrl);
 
-// await LoadLocalData();
-await DownloadAndSaveAllData();
+// HTTP client with retry handler
+var retryHandler = new RetryHandler(new HttpClientHandler()) { MaxRetries = 3 };
+var httpClient = new HttpClient(retryHandler) { Timeout = TimeSpan.FromMinutes(30) };
+
+// JWT token for target WordPress
+string? jwtToken = null;
+
+// Data collections
+List<Post> sourcePosts = [];
+List<Tag> sourceTags = [];
+List<User> sourceAuthors = [];
+List<Category> sourceCategories = [];
+List<Post> targetPosts = [];
+List<Tag> targetTags = [];
+List<User> targetAuthors = [];
+List<Category> targetCategories = [];
+
+// Lookup dictionaries
+var sourceTagsDict = new Dictionary<int, Tag>();
+var sourceUsersDict = new Dictionary<int, User>();
+var sourceCategoriesDict = new Dictionary<int, Category>();
+var targetTagsDict = new Dictionary<string, Tag>();
+var targetAuthorsDict = new Dictionary<string, User>();
+var targetCategoriesDict = new Dictionary<string, Category>();
+
+// Media upload cache (source URL -> target MediaItem) to avoid re-uploading
+var mediaCache = new Dictionary<string, MediaCacheItem>();
+
+// =============================================================================
+// MAIN EXECUTION
+// =============================================================================
+
+await AuthenticateTargetWp();
+await LoadCache();
+await DownloadNewData();
 await ProcessPosts();
-// await ProcessPosts(slug: "puzzling-places");
+await SaveCache();
 await GenerateRedirects();
 
-// async Task LoadLocalData()
-// {
-//     if (File.Exists("wpPosts.txt"))
-//         wpPosts = JsonConvert.DeserializeObject<List<Post>>(await File.ReadAllTextAsync("wpPosts.txt"));
-//     if (File.Exists("wpTags.txt"))
-//         wpTags = JsonConvert.DeserializeObject<List<Tag>>(await File.ReadAllTextAsync("wpTags.txt"));
-//     if (File.Exists("wpUsers.txt"))
-//         wpAuthors = JsonConvert.DeserializeObject<List<User>>(await File.ReadAllTextAsync("wpUsers.txt"));
-//     if (File.Exists("wpCategories.txt"))
-//         wpCategories = JsonConvert.DeserializeObject<List<Category>>(await File.ReadAllTextAsync("wpCategories.txt"));
-//     if (File.Exists("ghostPosts.txt"))
-//         ghostPosts = JsonConvert.DeserializeObject<List<GhostPost>>(await File.ReadAllTextAsync("ghostPosts.txt"));
-//     if (File.Exists("ghostTags.txt"))
-//         ghostTags = JsonConvert.DeserializeObject<List<GhostTag>>(await File.ReadAllTextAsync("ghostTags.txt"));
-// }
+Console.WriteLine("\nMigration complete!");
+return;
 
-async Task DownloadAndSaveAllData()
+// =============================================================================
+// AUTHENTICATION
+// =============================================================================
+
+async Task AuthenticateTargetWp()
 {
-    // Load existing data if available
-    var existingPostIds = new HashSet<int>();
-    var wpPostsFile = Path.Combine(dataFolder, "wpPosts.txt");
-    if (File.Exists(wpPostsFile))
+    Console.WriteLine("Authenticating with target WordPress...");
+
+    // MiniOrange JWT plugin endpoint
+    var tokenRequest = new HttpRequestMessage(HttpMethod.Post, $"{targetWpApiUrl}api/v1/token");
+    tokenRequest.Content = new StringContent(
+        JsonConvert.SerializeObject(new { username = targetWpUsername, password = targetWpPassword }),
+        Encoding.UTF8,
+        "application/json");
+
+    var response = await httpClient.SendAsync(tokenRequest);
+    var json = await response.Content.ReadAsStringAsync();
+
+    if (!response.IsSuccessStatusCode)
     {
-        var existingPosts = JsonConvert.DeserializeObject<List<Post>>(await File.ReadAllTextAsync(wpPostsFile));
-        if (existingPosts != null)
+        Console.WriteLine($"JWT authentication failed: {json}");
+        Console.WriteLine("Make sure JWT Authentication plugin is installed and configured.");
+        Environment.Exit(1);
+    }
+
+    Console.WriteLine($"Response: {json}");
+
+    var result = JObject.Parse(json);
+    // Try different token field names used by various JWT plugins
+    jwtToken = result["token"]?.ToString()
+            ?? result["jwt_token"]?.ToString()
+            ?? result["access_token"]?.ToString()
+            ?? result["data"]?["token"]?.ToString();
+
+    if (string.IsNullOrEmpty(jwtToken))
+    {
+        Console.WriteLine("Failed to get JWT token from response");
+        Environment.Exit(1);
+    }
+
+    // Configure WordPressPCL to use JWT
+    targetWp.Auth.SetJWToken(jwtToken);
+
+    var displayName = result["user_display_name"]?.ToString()
+                   ?? result["name"]?.ToString()
+                   ?? result["user"]?.ToString()
+                   ?? "unknown";
+    Console.WriteLine($"Authenticated as: {displayName}");
+}
+
+HttpRequestMessage CreateAuthenticatedRequest(HttpMethod method, string url)
+{
+    var request = new HttpRequestMessage(method, url);
+    if (!string.IsNullOrEmpty(jwtToken))
+    {
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", jwtToken);
+    }
+    return request;
+}
+
+// =============================================================================
+// CACHE MANAGEMENT
+// =============================================================================
+
+async Task LoadCache()
+{
+    Console.WriteLine("\nLoading cached data...");
+
+    sourcePosts = await LoadFromCache<List<Post>>("sourcePosts.json") ?? [];
+    sourceTags = await LoadFromCache<List<Tag>>("sourceTags.json") ?? [];
+    sourceAuthors = await LoadFromCache<List<User>>("sourceAuthors.json") ?? [];
+    sourceCategories = await LoadFromCache<List<Category>>("sourceCategories.json") ?? [];
+    targetPosts = await LoadFromCache<List<Post>>("targetPosts.json") ?? [];
+    targetTags = await LoadFromCache<List<Tag>>("targetTags.json") ?? [];
+    targetAuthors = await LoadFromCache<List<User>>("targetAuthors.json") ?? [];
+    targetCategories = await LoadFromCache<List<Category>>("targetCategories.json") ?? [];
+    mediaCache = await LoadFromCache<Dictionary<string, MediaCacheItem>>("mediaCache.json") ?? [];
+
+    Console.WriteLine($"  Source: {sourcePosts.Count} posts, {sourceTags.Count} tags, {sourceCategories.Count} categories");
+    Console.WriteLine($"  Target: {targetPosts.Count} posts, {targetTags.Count} tags, {targetCategories.Count} categories");
+    Console.WriteLine($"  Media cache: {mediaCache.Count} items");
+}
+
+async Task SaveCache()
+{
+    Console.WriteLine("\nSaving cache...");
+
+    await SaveToCache("sourcePosts.json", sourcePosts);
+    await SaveToCache("sourceTags.json", sourceTags);
+    await SaveToCache("sourceAuthors.json", sourceAuthors);
+    await SaveToCache("sourceCategories.json", sourceCategories);
+    await SaveToCache("targetPosts.json", targetPosts);
+    await SaveToCache("targetTags.json", targetTags);
+    await SaveToCache("targetAuthors.json", targetAuthors);
+    await SaveToCache("targetCategories.json", targetCategories);
+    await SaveToCache("mediaCache.json", mediaCache);
+}
+
+async Task<T?> LoadFromCache<T>(string fileName) where T : class
+{
+    var path = Path.Combine(dataFolder, fileName);
+    if (!File.Exists(path)) return null;
+
+    try
+    {
+        var json = await File.ReadAllTextAsync(path);
+        return JsonConvert.DeserializeObject<T>(json);
+    }
+    catch
+    {
+        return null;
+    }
+}
+
+async Task SaveToCache<T>(string fileName, T data)
+{
+    var path = Path.Combine(dataFolder, fileName);
+    var json = JsonConvert.SerializeObject(data, Formatting.Indented);
+    await File.WriteAllTextAsync(path, json);
+}
+
+// =============================================================================
+// DATA DOWNLOAD
+// =============================================================================
+
+async Task DownloadNewData()
+{
+    Console.WriteLine("\nChecking for new data...");
+
+    // Get existing IDs
+    var existingSourceIds = sourcePosts.Select(p => p.Id).ToHashSet();
+    var existingTargetIds = targetPosts.Select(p => p.Id).ToHashSet();
+
+    // Check for new source posts
+    var newSourceIds = await GetNewPostIds(sourceWpApiUrl, existingSourceIds);
+    if (newSourceIds.Count > 0)
+    {
+        Console.WriteLine($"Downloading {newSourceIds.Count} new source posts...");
+        foreach (var (id, index) in newSourceIds.Select((id, i) => (id, i)))
         {
-            wpPosts = existingPosts;
-            foreach (var p in existingPosts)
-                existingPostIds.Add(p.Id);
-            Console.WriteLine($"Loaded {existingPostIds.Count} existing WP posts from cache");
+            Console.Write($"\r  Progress: {index + 1}/{newSourceIds.Count}");
+            var post = await sourceWp.Posts.GetByIDAsync(id);
+            sourcePosts.Add(post);
+        }
+        Console.WriteLine();
+    }
+
+    // Check for new target posts
+    var newTargetIds = await GetNewPostIds(targetWpApiUrl, existingTargetIds);
+    if (newTargetIds.Count > 0)
+    {
+        Console.WriteLine($"Downloading {newTargetIds.Count} new target posts...");
+        foreach (var (id, index) in newTargetIds.Select((id, i) => (id, i)))
+        {
+            Console.Write($"\r  Progress: {index + 1}/{newTargetIds.Count}");
+            var post = await targetWp.Posts.GetByIDAsync(id);
+            targetPosts.Add(post);
+        }
+        Console.WriteLine();
+    }
+
+    // Refresh metadata if cache was empty
+    if (sourceTags.Count == 0 || sourceCategories.Count == 0 || sourceAuthors.Count == 0)
+    {
+        Console.WriteLine("Downloading source metadata...");
+        sourceAuthors = (await sourceWp.Users.GetAllAsync()).ToList();
+        sourceTags = (await sourceWp.Tags.GetAllAsync()).ToList();
+        sourceCategories = (await sourceWp.Categories.GetAllAsync()).ToList();
+    }
+
+    if (targetTags.Count == 0 || targetCategories.Count == 0 || targetAuthors.Count == 0)
+    {
+        Console.WriteLine("Downloading target metadata...");
+        try
+        {
+            targetAuthors = (await targetWp.Users.GetAllAsync()).ToList();
+            targetTags = (await targetWp.Tags.GetAllAsync()).ToList();
+            targetCategories = (await targetWp.Categories.GetAllAsync()).ToList();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  WordPressPCL failed: {ex.Message}");
+            Console.WriteLine("  Falling back to direct API calls...");
+            targetAuthors = await FetchAllFromApi<User>("users") ?? [];
+            targetTags = await FetchAllFromApi<Tag>("tags") ?? [];
+            targetCategories = await FetchAllFromApi<Category>("categories") ?? [];
         }
     }
 
-    wpPosts ??= [];
+    // Build lookup dictionaries
+    BuildLookupDictionaries();
 
-    // First, fetch only IDs to check what's new (minimal data transfer)
-    Console.WriteLine("Checking for new WordPress posts...");
-    using var http = new HttpClient();
+    Console.WriteLine($"Ready: {sourcePosts.Count} source posts, {targetPosts.Count} target posts");
+}
+
+async Task<List<T>?> FetchAllFromApi<T>(string endpoint)
+{
+    try
+    {
+        var request = CreateAuthenticatedRequest(HttpMethod.Get, $"{targetWpApiUrl}wp/v2/{endpoint}?per_page=100");
+        var response = await httpClient.SendAsync(request);
+        var json = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+        {
+            Console.WriteLine($"  Error fetching {endpoint}: {json}");
+            return null;
+        }
+
+        return JsonConvert.DeserializeObject<List<T>>(json);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  Error fetching {endpoint}: {ex.Message}");
+        return null;
+    }
+}
+
+async Task<List<int>> GetNewPostIds(string apiUrl, HashSet<int> existingIds)
+{
+    var newIds = new List<int>();
     var page = 1;
-    var newPostIds = new List<int>();
 
     while (true)
     {
         try
         {
-            var url = $"https://holographica.space/wp-json/wp/v2/posts?_fields=id&per_page=100&page={page}";
-            var response = await http.GetAsync(url);
-
-            if (!response.IsSuccessStatusCode) break; // No more pages
+            var url = $"{apiUrl}wp/v2/posts?_fields=id&per_page=100&page={page}";
+            Console.WriteLine($"  Fetching: {url}");
+            var response = await httpClient.GetAsync(url);
 
             var json = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"  Error: {response.StatusCode} - {json}");
+                break;
+            }
+
             var ids = JsonConvert.DeserializeObject<List<IdOnly>>(json) ?? [];
+            Console.WriteLine($"  Found {ids.Count} posts on page {page}");
 
             if (ids.Count == 0) break;
 
-            foreach (var item in ids)
-            {
-                if (!existingPostIds.Contains(item.Id))
-                    newPostIds.Add(item.Id);
-            }
-
+            newIds.AddRange(ids.Where(i => !existingIds.Contains(i.Id)).Select(i => i.Id));
             page++;
         }
         catch
         {
-            break; // Error fetching page, stop
+            break;
         }
     }
 
-    Console.WriteLine($"Found {newPostIds.Count} new posts");
-
-    // Download only new posts
-    if (newPostIds.Count > 0)
-    {
-        Console.WriteLine("Downloading new posts...");
-        var downloaded = 0;
-        foreach (var id in newPostIds)
-        {
-            downloaded++;
-            Console.Write($"\r  Downloading post {downloaded}/{newPostIds.Count}...");
-            var post = await wp.Posts.GetByIDAsync(id);
-            wpPosts.Add(post);
-        }
-        Console.WriteLine($"\r  Downloaded {newPostIds.Count} new posts              ");
-    }
-
-    wpAuthors = (await wp.Users.GetAllAsync()).ToList();
-    wpTags = (await wp.Tags.GetAllAsync()).ToList();
-    wpCategories = (await wp.Categories.GetAllAsync()).ToList();
-
-    Console.WriteLine("Downloading Ghost data...");
-    ghostPosts = await ghostClient.GetAllPostsAsync();
-    ghostTags = await ghostClient.GetAllTagsAsync();
-    ghostAuthors = await ghostClient.GetAllAuthorsAsync();
-
-    await File.WriteAllTextAsync(Path.Combine(dataFolder, "wpUsers.txt"), JsonConvert.SerializeObject(wpAuthors));
-    await File.WriteAllTextAsync(Path.Combine(dataFolder, "wpTags.txt"), JsonConvert.SerializeObject(wpTags));
-    await File.WriteAllTextAsync(wpPostsFile, JsonConvert.SerializeObject(wpPosts));
-    await File.WriteAllTextAsync(Path.Combine(dataFolder, "wpCategories.txt"), JsonConvert.SerializeObject(wpCategories));
-    await File.WriteAllTextAsync(Path.Combine(dataFolder, "ghostPosts.txt"), JsonConvert.SerializeObject(ghostPosts));
-    await File.WriteAllTextAsync(Path.Combine(dataFolder, "ghostTags.txt"), JsonConvert.SerializeObject(ghostTags));
-    await File.WriteAllTextAsync(Path.Combine(dataFolder, "ghostAuthors.txt"), JsonConvert.SerializeObject(ghostAuthors));
-
-    Console.WriteLine($"Saved {wpPosts.Count} WP posts, {ghostPosts.Count} Ghost posts, {ghostAuthors.Count} Ghost authors");
+    return newIds;
 }
 
-async Task ProcessPosts(int? count = null, string? slug = null)
+void BuildLookupDictionaries()
 {
-    BuildLookupDictionaries();
-    if (wpPosts == null) return;
+    sourceTagsDict = sourceTags.ToDictionary(t => t.Id);
+    sourceUsersDict = sourceAuthors.ToDictionary(u => u.Id);
+    sourceCategoriesDict = sourceCategories.ToDictionary(c => c.Id);
+    targetTagsDict = targetTags.ToDictionary(t => t.Slug);
+    targetAuthorsDict = targetAuthors.ToDictionary(u => u.Slug);
+    targetCategoriesDict = targetCategories.ToDictionary(c => c.Slug);
+}
+
+// =============================================================================
+// POST PROCESSING
+// =============================================================================
+
+async Task ProcessPosts(int? limit = null, string? slug = null)
+{
+    Console.WriteLine("\nProcessing posts...");
 
     IEnumerable<Post> postsToProcess;
 
     if (!string.IsNullOrEmpty(slug))
     {
-        // Process a specific post by slug
-        postsToProcess = wpPosts.Where(p => p.Slug == slug);
+        postsToProcess = sourcePosts.Where(p => p.Slug == slug);
     }
     else
     {
-        // Process posts not yet in Ghost
-        postsToProcess = wpPosts.Where(p => ghostPosts?.Any(g => g.Slug == p.Slug) != true);
+        var targetSlugs = targetPosts.Select(p => p.Slug).ToHashSet();
+        postsToProcess = sourcePosts.Where(p => !targetSlugs.Contains(p.Slug));
 
-        if (count.HasValue)
-            postsToProcess = postsToProcess.Take(count.Value);
+        if (limit.HasValue)
+            postsToProcess = postsToProcess.Take(limit.Value);
     }
 
     var postsList = postsToProcess.ToList();
-    var total = postsList.Count;
 
-    if (total == 0)
+    if (postsList.Count == 0)
     {
-        Console.WriteLine(slug != null ? $"Post with slug '{slug}' not found" : "No posts to process");
+        Console.WriteLine("No posts to process.");
         return;
     }
 
-    Console.WriteLine($"Processing {total} post(s)...");
+    Console.WriteLine($"Processing {postsList.Count} post(s)...\n");
 
-    var processed = 0;
-    foreach (var wpPost in postsList)
+    for (var i = 0; i < postsList.Count; i++)
     {
-        processed++;
-        var progress = (processed / (decimal)total * 100).ToString("F2");
-        Console.Write($"Progress {progress}% ");
+        var sourcePost = postsList[i];
+        var progress = ((i + 1) / (decimal)postsList.Count * 100).ToString("F1");
+        Console.WriteLine($"[{progress}%] Processing: {sourcePost.Slug}");
 
-        await MovePostToGhost(wpPost, wpPost.Slug);
+        try
+        {
+            await MigratePost(sourcePost);
+            await SaveCache(); // Save after each successful migration
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  ERROR: {ex.Message}");
+        }
+
+        Console.WriteLine();
     }
 }
 
-void BuildLookupDictionaries()
+async Task MigratePost(Post sourcePost)
 {
-    if (wpTags != null)
-        foreach (var tag in wpTags)
-            wpTagsDict[tag.Id] = tag.Slug;
+    // 1. Migrate tags
+    var tagIds = new List<int>();
+    foreach (var sourceTagId in sourcePost.Tags)
+    {
+        if (!sourceTagsDict.TryGetValue(sourceTagId, out var sourceTag)) continue;
 
-    if (wpAuthors != null)
-        foreach (var user in wpAuthors)
-            wpUsersDict[user.Id] = user;
+        if (targetTagsDict.TryGetValue(sourceTag.Slug, out var targetTag))
+        {
+            tagIds.Add(targetTag.Id);
+        }
+        else
+        {
+            try
+            {
+                Console.WriteLine($"  Creating tag: {sourceTag.Name}");
+                var newTag = await targetWp.Tags.CreateAsync(new Tag
+                {
+                    Name = sourceTag.Name,
+                    Slug = sourceTag.Slug,
+                    Description = sourceTag.Description
+                });
+                targetTags.Add(newTag);
+                targetTagsDict[newTag.Slug] = newTag;
+                tagIds.Add(newTag.Id);
+            }
+            catch
+            {
+                // Tag already exists, fetch it
+                var existing = (await targetWp.Tags.GetAllAsync(useAuth: true))
+                    .FirstOrDefault(t => t.Slug == sourceTag.Slug || t.Name == sourceTag.Name);
+                if (existing != null)
+                {
+                    targetTagsDict[existing.Slug] = existing;
+                    tagIds.Add(existing.Id);
+                }
+            }
+        }
+    }
 
-    if (ghostTags != null)
-        foreach (var tag in ghostTags)
-            ghostTagsDict[tag.Slug] = tag.Id;
+    // 2. Migrate categories
+    var categoryIds = new List<int>();
+    foreach (var sourceCatId in sourcePost.Categories)
+    {
+        if (!sourceCategoriesDict.TryGetValue(sourceCatId, out var sourceCat)) continue;
 
-    if (ghostAuthors != null)
-        foreach (var author in ghostAuthors)
-            ghostAuthorsDict[author.Slug] = author;
+        if (targetCategoriesDict.TryGetValue(sourceCat.Slug, out var targetCat))
+        {
+            categoryIds.Add(targetCat.Id);
+        }
+        else
+        {
+            try
+            {
+                Console.WriteLine($"  Creating category: {sourceCat.Name}");
+                var newCat = await targetWp.Categories.CreateAsync(new Category
+                {
+                    Name = sourceCat.Name,
+                    Slug = sourceCat.Slug,
+                    Description = sourceCat.Description
+                });
+                targetCategories.Add(newCat);
+                targetCategoriesDict[newCat.Slug] = newCat;
+                categoryIds.Add(newCat.Id);
+            }
+            catch
+            {
+                // Category already exists, fetch it
+                var existing = (await targetWp.Categories.GetAllAsync(useAuth: true))
+                    .FirstOrDefault(c => c.Slug == sourceCat.Slug || c.Name == sourceCat.Name);
+                if (existing != null)
+                {
+                    targetCategoriesDict[existing.Slug] = existing;
+                    categoryIds.Add(existing.Id);
+                }
+            }
+        }
+    }
+
+    // 3. Process content - migrate media
+    var content = sourcePost.Content.Rendered;
+    content = await ProcessContentMedia(content);
+    content = ProcessShortcodes(content);
+    content = CleanupHtml(content);
+
+    // 4. Map author
+    int authorId = 1; // Default to admin
+    if (sourceUsersDict.TryGetValue(sourcePost.Author, out var sourceAuthor))
+    {
+        var targetAuthor = targetAuthorsDict.Values.FirstOrDefault(a =>
+            a.Slug.Equals(sourceAuthor.Slug, StringComparison.OrdinalIgnoreCase) ||
+            a.Name.Equals(sourceAuthor.Name, StringComparison.OrdinalIgnoreCase));
+
+        if (targetAuthor != null)
+        {
+            authorId = targetAuthor.Id;
+            Console.WriteLine($"  Author: {sourceAuthor.Name} -> {targetAuthor.Name}");
+        }
+        else
+        {
+            Console.WriteLine($"  Warning: No matching author for '{sourceAuthor.Name}'");
+        }
+    }
+
+    // 6. Get custom fields (meta) from source post
+    var customMeta = await GetPostMeta(sourcePost.Id);
+
+    // 7. Prepare excerpt
+    var excerpt = sourcePost.Excerpt.Rendered;
+    if (!string.IsNullOrEmpty(excerpt))
+    {
+        var doc = new HtmlDocument();
+        doc.LoadHtml(excerpt);
+        excerpt = WebUtility.HtmlDecode(doc.DocumentNode.InnerText.Trim());
+    }
+
+    // 8. Create post on target
+    var newPost = new Post
+    {
+        Title = new Title(WebUtility.HtmlDecode(sourcePost.Title.Rendered)),
+        Slug = sourcePost.Slug,
+        Content = new Content(content),
+        Excerpt = new Excerpt(excerpt ?? ""),
+        Status = sourcePost.Status,
+        Date = sourcePost.Date,
+        Tags = tagIds,
+        Categories = categoryIds,
+        Author = authorId
+    };
+
+    var createdPost = await targetWp.Posts.CreateAsync(newPost);
+    Console.WriteLine($"  Created post ID: {createdPost.Id}");
+
+    // 9. Update custom fields on target post
+    if (customMeta != null && customMeta.Count > 0)
+    {
+        await UpdatePostMeta(createdPost.Id, customMeta);
+        Console.WriteLine($"  Updated {customMeta.Count} custom field(s)");
+    }
+
+    targetPosts.Add(createdPost);
 }
+
+// =============================================================================
+// CUSTOM FIELDS (META)
+// =============================================================================
+
+async Task<Dictionary<string, object>?> GetPostMeta(int postId)
+{
+    try
+    {
+        var url = $"{sourceWpApiUrl}wp/v2/posts/{postId}?_fields=meta";
+        var response = await httpClient.GetAsync(url);
+
+        if (!response.IsSuccessStatusCode) return null;
+
+        var json = await response.Content.ReadAsStringAsync();
+        var result = JObject.Parse(json);
+        return result["meta"]?.ToObject<Dictionary<string, object>>();
+    }
+    catch
+    {
+        return null;
+    }
+}
+
+async Task UpdatePostMeta(int postId, Dictionary<string, object> meta)
+{
+    try
+    {
+        var url = $"{targetWpApiUrl}wp/v2/posts/{postId}";
+        var request = CreateAuthenticatedRequest(HttpMethod.Post, url);
+
+        var payload = new { meta };
+        request.Content = new StringContent(
+            JsonConvert.SerializeObject(payload),
+            Encoding.UTF8,
+            "application/json");
+
+        var response = await httpClient.SendAsync(request);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var error = await response.Content.ReadAsStringAsync();
+            Console.WriteLine($"  Warning: Failed to update meta: {error}");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  Warning: Meta update error: {ex.Message}");
+    }
+}
+
+// =============================================================================
+// MEDIA HANDLING
+// =============================================================================
+
+async Task<string> ProcessContentMedia(string content)
+{
+    var doc = new HtmlDocument();
+    doc.LoadHtml(content);
+
+    // Process images
+    foreach (var img in doc.DocumentNode.SelectNodes("//img[@src]") ?? Enumerable.Empty<HtmlNode>())
+    {
+        var src = img.GetAttributeValue("src", "");
+        if (string.IsNullOrEmpty(src) || !IsSourceMedia(src)) continue;
+
+        var uploaded = await UploadMedia(src);
+        if (uploaded == null) continue;
+
+        img.SetAttributeValue("src", uploaded.SourceUrl);
+        img.Attributes.Remove("srcset"); // Remove srcset to prevent broken responsive images
+    }
+
+    // Process video sources
+    foreach (var source in doc.DocumentNode.SelectNodes("//video//source[@src] | //video[@src]") ?? Enumerable.Empty<HtmlNode>())
+    {
+        var src = source.GetAttributeValue("src", "");
+        if (string.IsNullOrEmpty(src) || !IsSourceMedia(src)) continue;
+
+        var uploaded = await UploadMedia(src);
+        if (uploaded != null)
+        {
+            source.SetAttributeValue("src", uploaded.SourceUrl);
+        }
+    }
+
+    // Process anchor links to media files
+    foreach (var anchor in doc.DocumentNode.SelectNodes("//a[@href]"))
+    {
+        var href = anchor.GetAttributeValue("href", "");
+        if (string.IsNullOrEmpty(href) || !IsSourceMedia(href)) continue;
+
+        // Check if it's a document/file (not image/video which are handled above)
+        var ext = Path.GetExtension(href).ToLower().Split('?')[0];
+        if (ext is ".pdf" or ".doc" or ".docx" or ".xls" or ".xlsx" or ".ppt" or ".pptx" or ".zip" or ".rar")
+        {
+            var uploaded = await UploadMedia(href);
+            if (uploaded != null)
+            {
+                anchor.SetAttributeValue("href", uploaded.SourceUrl);
+            }
+        }
+    }
+
+    return doc.DocumentNode.OuterHtml;
+}
+
+bool IsSourceMedia(string url)
+{
+    return url.Contains(sourceWpUrl) || url.Contains("holographica.space/wp-content/uploads");
+}
+
+[SuppressMessage("ReSharper", "PossibleLossOfFraction")]
+async Task<MediaItem?> UploadMedia(string sourceUrl)
+{
+    // Check cache first
+    if (mediaCache.TryGetValue(sourceUrl, out var cached))
+    {
+        Console.WriteLine($"  [Cached] {Path.GetFileName(new Uri(sourceUrl).LocalPath)}");
+        return new MediaItem { Id = cached.Id, SourceUrl = cached.Url };
+    }
+
+    try
+    {
+        var uri = new Uri(sourceUrl);
+        var fileName = Path.GetFileName(uri.LocalPath);
+        fileName = Regex.Replace(fileName, @"[^\u0000-\u007F]+", "");
+        if (fileName.Length > 100)
+        {
+            var ext = Path.GetExtension(fileName);
+            fileName = fileName[..(100 - ext.Length)] + ext;
+        }
+
+        Console.Write($"  Downloading: {fileName}...");
+
+        // Download
+        using var downloadResponse = await httpClient.GetAsync(sourceUrl, HttpCompletionOption.ResponseHeadersRead);
+        if (!downloadResponse.IsSuccessStatusCode)
+        {
+            Console.WriteLine($" Failed ({downloadResponse.StatusCode})");
+            return null;
+        }
+
+        var totalBytes = downloadResponse.Content.Headers.ContentLength ?? 0;
+        await using var downloadStream = await downloadResponse.Content.ReadAsStreamAsync();
+        using var memoryStream = new MemoryStream();
+
+        var buffer = new byte[81920];
+        int bytesRead;
+        long totalRead = 0;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        while ((bytesRead = await downloadStream.ReadAsync(buffer)) > 0)
+        {
+            await memoryStream.WriteAsync(buffer.AsMemory(0, bytesRead));
+            totalRead += bytesRead;
+
+            if (totalBytes > 0 && sw.ElapsedMilliseconds > 500)
+            {
+                var pct = totalRead * 100 / totalBytes;
+                Console.Write($"\r  Downloading: {fileName}... {pct}%   ");
+            }
+        }
+
+        var mediaBytes = memoryStream.ToArray();
+        Console.Write($"\r  Uploading: {fileName} ({mediaBytes.Length / 1024}KB)...   ");
+
+        // Upload to target
+        var uploadUrl = $"{targetWpApiUrl}wp/v2/media";
+        var request = CreateAuthenticatedRequest(HttpMethod.Post, uploadUrl);
+
+        using var uploadContent = new ByteArrayContent(mediaBytes);
+        uploadContent.Headers.ContentType = new MediaTypeHeaderValue(GetMimeType(fileName));
+        uploadContent.Headers.ContentDisposition = new ContentDispositionHeaderValue("attachment")
+        {
+            FileName = fileName
+        };
+        request.Content = uploadContent;
+
+        var response = await httpClient.SendAsync(request);
+        var json = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+        {
+            Console.WriteLine($" Upload failed");
+            return null;
+        }
+
+        var result = JsonConvert.DeserializeObject<MediaItem>(json);
+        Console.WriteLine($"\r  Uploaded: {fileName} -> ID {result?.Id}                    ");
+
+        // Cache the result
+        if (result != null)
+        {
+            mediaCache[sourceUrl] = new MediaCacheItem { Id = result.Id, Url = result.SourceUrl };
+        }
+
+        return result;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($" Error: {ex.Message}");
+        return null;
+    }
+}
+
+static string GetMimeType(string fileName)
+{
+    var ext = Path.GetExtension(fileName).ToLower();
+    return ext switch
+    {
+        ".jpg" or ".jpeg" => "image/jpeg",
+        ".png" => "image/png",
+        ".gif" => "image/gif",
+        ".webp" => "image/webp",
+        ".svg" => "image/svg+xml",
+        ".pdf" => "application/pdf",
+        ".doc" => "application/msword",
+        ".docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xls" => "application/vnd.ms-excel",
+        ".xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".ppt" => "application/vnd.ms-powerpoint",
+        ".pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".zip" => "application/zip",
+        ".rar" => "application/vnd.rar",
+        ".txt" => "text/plain",
+        ".csv" => "text/csv",
+        ".mp4" => "video/mp4",
+        ".webm" => "video/webm",
+        ".ogg" => "video/ogg",
+        ".mov" => "video/quicktime",
+        ".mp3" => "audio/mpeg",
+        ".wav" => "audio/wav",
+        _ => "application/octet-stream"
+    };
+}
+
+// =============================================================================
+// CONTENT PROCESSING
+// =============================================================================
+
+string ProcessShortcodes(string content)
+{
+    // Process [embed] shortcodes for YouTube/Vimeo
+    content = Regex.Replace(content, @"\[embed\](https?://(?:www\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]+)[^\[]*)\[/embed\]",
+        m => $@"<figure class=""wp-block-embed is-type-video is-provider-youtube""><div class=""wp-block-embed__wrapper""><iframe width=""560"" height=""315"" src=""https://www.youtube.com/embed/{m.Groups[2].Value}"" frameborder=""0"" allowfullscreen></iframe></div></figure>",
+        RegexOptions.IgnoreCase);
+
+    content = Regex.Replace(content, @"\[embed\](https?://(?:www\.)?youtu\.be/([a-zA-Z0-9_-]+)[^\[]*)\[/embed\]",
+        m => $@"<figure class=""wp-block-embed is-type-video is-provider-youtube""><div class=""wp-block-embed__wrapper""><iframe width=""560"" height=""315"" src=""https://www.youtube.com/embed/{m.Groups[2].Value}"" frameborder=""0"" allowfullscreen></iframe></div></figure>",
+        RegexOptions.IgnoreCase);
+
+    content = Regex.Replace(content, @"\[embed\](https?://(?:www\.)?vimeo\.com/(\d+)[^\[]*)\[/embed\]",
+        m => $@"<figure class=""wp-block-embed is-type-video is-provider-vimeo""><div class=""wp-block-embed__wrapper""><iframe src=""https://player.vimeo.com/video/{m.Groups[2].Value}"" width=""560"" height=""315"" frameborder=""0"" allowfullscreen></iframe></div></figure>",
+        RegexOptions.IgnoreCase);
+
+    // Remove TablePress shortcodes (tables should already be rendered in content)
+    content = Regex.Replace(content, @"\[/?table(?:press)?[^\]]*\]", "", RegexOptions.IgnoreCase);
+
+    // Process [video] shortcodes
+    content = Regex.Replace(content, @"\[video\s+[^\]]*(?:mp4|src)=[""']([^""']+)[""'][^\]]*\](?:\[/video\])?",
+        m => $@"<figure class=""wp-block-video""><video controls src=""{m.Groups[1].Value}""></video></figure>",
+        RegexOptions.IgnoreCase);
+
+    return content;
+}
+
+string CleanupHtml(string content)
+{
+    var doc = new HtmlDocument();
+    doc.LoadHtml(content);
+
+    // Clean up TablePress tables
+    foreach (var table in doc.DocumentNode.SelectNodes("//table[contains(@class, 'tablepress')]") ?? Enumerable.Empty<HtmlNode>())
+    {
+        // Remove TablePress-specific classes but keep the table
+        var currentClass = table.GetAttributeValue("class", "");
+        var newClass = Regex.Replace(currentClass, @"tablepress\s*tablepress-id-\d+\s*", "").Trim();
+        if (string.IsNullOrEmpty(newClass))
+        {
+            table.Attributes.Remove("class");
+        }
+        else
+        {
+            table.SetAttributeValue("class", newClass);
+        }
+
+        // Remove data attributes
+        foreach (var attr in table.Attributes.Where(a => a.Name.StartsWith("data-")).ToList())
+        {
+            table.Attributes.Remove(attr);
+        }
+    }
+
+    // Remove TablePress wrapper divs
+    foreach (var wrapper in (doc.DocumentNode.SelectNodes("//div[contains(@class, 'tablepress-scroll-wrapper')]") ?? Enumerable.Empty<HtmlNode>()).ToList())
+    {
+        var innerContent = wrapper.InnerHtml;
+        var textNode = HtmlNode.CreateNode(innerContent);
+        wrapper.ParentNode?.ReplaceChild(textNode, wrapper);
+    }
+
+    // Wrap standalone iframes in figure tags
+    foreach (var iframe in (doc.DocumentNode.SelectNodes("//iframe[not(ancestor::figure)]") ?? Enumerable.Empty<HtmlNode>()).ToList())
+    {
+        var figure = doc.CreateElement("figure");
+        figure.SetAttributeValue("class", "wp-block-embed");
+        var wrapperDiv = doc.CreateElement("div");
+        wrapperDiv.SetAttributeValue("class", "wp-block-embed__wrapper");
+        wrapperDiv.InnerHtml = iframe.OuterHtml;
+        figure.AppendChild(wrapperDiv);
+        iframe.ParentNode?.ReplaceChild(figure, iframe);
+    }
+
+    return doc.DocumentNode.OuterHtml;
+}
+
+// =============================================================================
+// REDIRECTS
+// =============================================================================
 
 async Task GenerateRedirects()
 {
-    BuildLookupDictionaries();
-    if (wpPosts == null || wpCategories == null) return;
+    Console.WriteLine("\nGenerating redirects...");
 
     var redirects = new List<object>();
 
-    foreach (var post in wpPosts)
+    foreach (var post in sourcePosts)
     {
         var categoryId = post.Categories.FirstOrDefault();
-        var category = wpCategories.FirstOrDefault(c => c.Id == categoryId);
-        var categorySlug = category?.Slug ?? "uncategorized";
+        var categorySlug = "uncategorized";
 
-        // WordPress URL: /category/post-slug/
-        // Ghost URL: /post-slug/
+        if (categoryId > 0 && sourceCategoriesDict.TryGetValue(categoryId, out var cat))
+        {
+            categorySlug = cat.Slug;
+        }
+
         redirects.Add(new
         {
             from = $"/{categorySlug}/{post.Slug}/",
@@ -238,1021 +885,101 @@ async Task GenerateRedirects()
     var json = JsonConvert.SerializeObject(redirects, Formatting.Indented);
     var redirectsFile = Path.Combine(dataFolder, "redirects.json");
     await File.WriteAllTextAsync(redirectsFile, json);
+
     Console.WriteLine($"Generated {redirects.Count} redirects to {redirectsFile}");
 }
 
-async Task MovePostToGhost(Post wpPost, string targetSlug)
-{
-    Console.WriteLine($"Raw: {wpPost.Content.Raw} \nRendered: {wpPost.Content.Rendered}");
-    Console.WriteLine($"Creating post: {targetSlug}");
-
-    // Convert WP tags to Ghost tags
-    var postTags = new List<GhostTag>();
-    foreach (var tagId in wpPost.Tags)
-    {
-        if (!wpTagsDict.TryGetValue(tagId, out var slug)) continue;
-
-        var tagName = wpTags?.FirstOrDefault(t => t.Id == tagId)?.Name ?? slug;
-
-        if (ghostTagsDict.TryGetValue(slug, out var ghostTagId))
-        {
-            postTags.Add(new GhostTag { Id = ghostTagId, Slug = slug, Name = tagName });
-        }
-        else
-        {
-            // Create new tag in Ghost
-            var newTag = await ghostClient.CreateTagAsync(slug, tagName);
-            if (newTag == null) continue;
-            ghostTags?.Add(newTag);
-            ghostTagsDict[newTag.Slug] = newTag.Id;
-            postTags.Add(newTag);
-        }
-    }
-
-    // Also convert categories to tags (Ghost doesn't have categories)
-    foreach (var category in wpPost.Categories.Select(catId => wpCategories?.FirstOrDefault(c => c.Id == catId)).Where(category => category != null))
-    {
-        if (ghostTagsDict.TryGetValue(category!.Slug, out var ghostTagId))
-        {
-            postTags.Add(new GhostTag { Id = ghostTagId, Slug = category.Slug, Name = category.Name });
-        }
-        else
-        {
-            var newTag = await ghostClient.CreateTagAsync(category.Slug, category.Name);
-            if (newTag == null) continue;
-            ghostTags?.Add(newTag);
-            ghostTagsDict[newTag.Slug] = newTag.Id;
-            postTags.Add(newTag);
-        }
-    }
-
-    // Process images in content
-    var content = wpPost.Content.Rendered;
-    string? featureImage = null;
-    string? featureImageSrc = null;
-
-    html.LoadHtml(content);
-    var imgNodes = html.DocumentNode.SelectNodes("//img");
-    foreach (var imgNode in imgNodes ?? Enumerable.Empty<HtmlNode>())
-    {
-        var src = imgNode.GetAttributeValue("src", string.Empty);
-        if (string.IsNullOrEmpty(src)) continue;
-
-        try
-        {
-            // Upload image to Ghost
-            var uploadedUrl = await ghostClient.UploadImageAsync(src);
-            if (string.IsNullOrEmpty(uploadedUrl)) continue;
-
-            // First image becomes featured image
-            if (featureImage == null)
-            {
-                featureImage = uploadedUrl;
-                featureImageSrc = src;
-            }
-            else
-            {
-                // Update other images in content with new URL
-                content = content.Replace(src, uploadedUrl);
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Failed to upload image {src}: {ex.Message}");
-        }
-    }
-
-    // Remove the featured image from content to avoid duplication
-    if (featureImageSrc != null)
-    {
-        html.LoadHtml(content);
-        var featureImgNode = html.DocumentNode.SelectSingleNode($"//img[@src='{featureImageSrc}']");
-        if (featureImgNode != null)
-        {
-            // Remove the img tag and its parent if it's a figure or empty p/div
-            var parent = featureImgNode.ParentNode;
-            featureImgNode.Remove();
-            if (parent.Name == "figure" || (parent.Name is "p" or "div" && string.IsNullOrWhiteSpace(parent.InnerText)))
-            {
-                parent.Remove();
-            }
-            content = html.DocumentNode.OuterHtml;
-        }
-    }
-
-    // Process file links (PDFs, documents, etc.) stored in WordPress
-    content = await ProcessFileLinks(content, ghostClient);
-
-    // Convert TablePress tables to Ghost tables
-    content = ProcessTablePressTables(content);
-
-    // Process videos in content
-    content = await ProcessVideos(content, ghostClient);
-
-    // Strip HTML tags from excerpt
-    var excerpt = wpPost.Excerpt.Rendered;
-    if (!string.IsNullOrEmpty(excerpt))
-    {
-        html.LoadHtml(excerpt);
-        excerpt = html.DocumentNode.InnerText.Trim();
-    }
-
-    // Map WordPress author to Ghost author
-    var postAuthors = new List<GhostAuthor>();
-    if (wpUsersDict.TryGetValue(wpPost.Author, out var wpAuthor))
-    {
-        // Try to find matching Ghost author by slug or name
-        var ghostAuthor = ghostAuthorsDict.Values.FirstOrDefault(a =>
-            a.Slug.Equals(wpAuthor.Slug, StringComparison.OrdinalIgnoreCase) ||
-            a.Name.Equals(wpAuthor.Name, StringComparison.OrdinalIgnoreCase));
-
-        if (ghostAuthor != null)
-        {
-            postAuthors.Add(ghostAuthor);
-            Console.WriteLine($"  Mapped author: {wpAuthor.Name} -> {ghostAuthor.Name}");
-        }
-        else
-        {
-            Console.WriteLine($"  Warning: No matching Ghost author for WP user '{wpAuthor.Name}' (slug: {wpAuthor.Slug})");
-        }
-    }
-
-
-    // DO NOT apply HtmlDecode to entire content - it corrupts HTML comments like <!--kg-card-begin: video-->
-    // WordPress HTML entities (&#8217; etc.) in text will be handled by Ghost during import
-    // We only decode title and excerpt which are plain text
-    var decodedContent = content; // Keep HTML intact
-
-    // Create Ghost post - decode HTML entities in title, content and excerpt
-    var ghostPost = new GhostPost
-    {
-        Title = System.Net.WebUtility.HtmlDecode(wpPost.Title.Rendered),
-        Slug = targetSlug,
-        Html = decodedContent,
-        CustomExcerpt = string.IsNullOrEmpty(excerpt) ? null : System.Net.WebUtility.HtmlDecode(excerpt),
-        Status = wpPost.Status == Status.Publish ? "published" : "draft",
-        PublishedAt = wpPost.Date,
-        Tags = postTags,
-        FeatureImage = featureImage,
-        Authors = postAuthors.Count > 0 ? postAuthors : null
-    };
-
-    var created = await ghostClient.CreatePostAsync(ghostPost);
-    if (created != null)
-    {
-        ghostPosts?.Add(created);
-        Console.WriteLine($"Created: {created.Slug}");
-
-    }
-}
-
-async Task<string> ProcessVideos(string content, GhostAdminClient client)
-{
-    var doc = new HtmlDocument();
-    doc.LoadHtml(content);
-    var videosProcessed = 0;
-    var videoReplacements = new Dictionary<string, string>(); // placeholder -> actual HTML with comments
-
-    // Video URL patterns
-    const string youtubePattern = @"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})";
-    const string vimeoPattern = @"(?:https?://)?(?:www\.)?(?:vimeo\.com/|player\.vimeo\.com/video/)(\d+)";
-    const string videoFilePattern = @"(https?://[^\s<>""']+\.(?:mp4|webm|ogg|mov))";
-
-    // NOTE: We do NOT convert anchor tags (<a href="video">) to embeds - those are just links
-    // Only process actual embedded video elements (shortcodes, iframes, video tags) below
-
-    // Process WordPress [video] shortcodes - e.g. [video mp4="url" ...][/video] or [video src="url" .../]
-    // WordPress uses format-specific attributes like mp4="...", webm="...", ogg="..." or generic src="..."
-    const string videoShortcodePattern = @"\[video\s+[^\]]*(?:mp4|webm|ogg|mov|src)=[""']([^""']+)[""'][^\]]*\](?:\[/video\])?";
-    var shortcodeMatches = Regex.Matches(content, videoShortcodePattern, RegexOptions.IgnoreCase);
-
-    // Also process [embed] shortcodes - e.g. [embed]https://youtube.com/...[/embed]
-    const string embedShortcodePattern = @"\[embed\]([^\[]+)\[/embed\]";
-    var embedMatches = Regex.Matches(content, embedShortcodePattern, RegexOptions.IgnoreCase);
-    foreach (Match match in embedMatches)
-    {
-        var url = match.Groups[1].Value.Trim();
-
-        // Check if it's a YouTube URL
-        var youtubeMatch = Regex.Match(url, youtubePattern);
-        if (youtubeMatch.Success)
-        {
-            var videoId = youtubeMatch.Groups[1].Value;
-            var embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe width=""560"" height=""315"" src=""https://www.youtube.com/embed/{videoId}"" frameborder=""0"" allow=""accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"" allowfullscreen></iframe></figure>";
-            content = content.Replace(match.Value, embedHtml);
-            videosProcessed++;
-            continue;
-        }
-
-        // Check if it's a Vimeo URL
-        var vimeoMatch = Regex.Match(url, vimeoPattern);
-        if (vimeoMatch.Success)
-        {
-            var videoId = vimeoMatch.Groups[1].Value;
-            var embedHtml = $@"<figure class=""kg-card kg-embed-card""><iframe src=""https://player.vimeo.com/video/{videoId}"" width=""560"" height=""315"" frameborder=""0"" allow=""autoplay; fullscreen; picture-in-picture"" allowfullscreen></iframe></figure>";
-            content = content.Replace(match.Value, embedHtml);
-            videosProcessed++;
-            continue;
-        }
-
-        // Check if it's a direct video file
-        var videoMatch = Regex.Match(url, videoFilePattern, RegexOptions.IgnoreCase);
-        if (videoMatch.Success)
-        {
-            var uploadedUrl = await client.UploadVideoAsync(url);
-            if (!string.IsNullOrEmpty(uploadedUrl))
-            {
-                // Use Ghost's HTML card to preserve the video tag
-                var embedHtml = $@"<!--kg-card-begin: html-->
-<div class=""video-container"" style=""position:relative;padding-bottom:56.25%;height:0;overflow:hidden;max-width:100%"">
-<video controls style=""position:absolute;top:0;left:0;width:100%;height:100%"" preload=""metadata"">
-<source src=""{uploadedUrl}"" type=""video/mp4"">
-Your browser does not support the video tag.
-</video>
-</div>
-<!--kg-card-end: html-->";
-                content = content.Replace(match.Value, embedHtml);
-                videosProcessed++;
-            }
-        }
-    }
-    foreach (Match match in shortcodeMatches)
-    {
-        var videoUrl = match.Groups[1].Value;
-        var uploadedUrl = await client.UploadVideoAsync(videoUrl);
-        if (string.IsNullOrEmpty(uploadedUrl)) continue;
-        // Use Ghost's HTML card to preserve the video tag
-        var embedHtml = $@"<!--kg-card-begin: html-->
-<div class=""video-container"" style=""position:relative;padding-bottom:56.25%;height:0;overflow:hidden;max-width:100%"">
-<video controls style=""position:absolute;top:0;left:0;width:100%;height:100%"" preload=""metadata"">
-<source src=""{uploadedUrl}"" type=""video/mp4"">
-Your browser does not support the video tag.
-</video>
-</div>
-<!--kg-card-end: html-->";
-        content = content.Replace(match.Value, embedHtml);
-        videosProcessed++;
-    }
-
-    // Reload doc after shortcode processing
-    doc.LoadHtml(content);
-
-    // Process existing <video> tags - upload source to Ghost
-    var videoNodes = doc.DocumentNode.SelectNodes("//video");
-    if (videoNodes != null)
-    foreach (var video in videoNodes.ToList())
-    {
-        // Get video source - either from src attribute or from <source> child
-        var src = video.GetAttributeValue("src", "");
-        if (string.IsNullOrEmpty(src))
-        {
-            var sourceNode = video.SelectSingleNode(".//source[@src]");
-            src = sourceNode?.GetAttributeValue("src", "") ?? "";
-        }
-
-        if (string.IsNullOrEmpty(src)) continue;
-
-        // Upload to Ghost
-        var uploadedUrl = await client.UploadVideoAsync(src);
-        if (string.IsNullOrEmpty(uploadedUrl)) continue;
-
-        // Ghost seems to strip video tags from HTML content. Try using an HTML embed card with iframe-like structure.
-        // This uses a raw HTML block that Ghost should preserve.
-        var placeholder = $"__VIDEO_PLACEHOLDER_{videosProcessed}__";
-        // Use an iframe with video - this might be preserved better than raw video tag
-        var embedHtml = $@"<!--kg-card-begin: html-->
-<div class=""video-container"" style=""position:relative;padding-bottom:56.25%;height:0;overflow:hidden;max-width:100%"">
-<video controls style=""position:absolute;top:0;left:0;width:100%;height:100%"" preload=""metadata"">
-<source src=""{uploadedUrl}"" type=""video/mp4"">
-Your browser does not support the video tag.
-</video>
-</div>
-<!--kg-card-end: html-->";
-
-        // Replace video or its parent figure with a placeholder span
-        var placeholderNode = HtmlNode.CreateNode($"<span>{placeholder}</span>");
-        var parent = video.ParentNode;
-        if (parent.Name == "figure")
-        {
-            parent.ParentNode.ReplaceChild(placeholderNode, parent);
-        }
-        else
-        {
-            parent.ReplaceChild(placeholderNode, video);
-        }
-
-        // Store for later replacement in the final HTML string
-        videoReplacements[placeholder] = embedHtml;
-        videosProcessed++;
-    }
-
-    // Process existing iframes (YouTube/Vimeo embeds from WordPress)
-    var iframeNodes = doc.DocumentNode.SelectNodes("//iframe[@src]");
-    if (iframeNodes != null)
-    foreach (var iframe in iframeNodes.ToList())
-    {
-        var src = iframe.GetAttributeValue("src", "");
-        if (string.IsNullOrEmpty(src)) continue;
-
-        // Ensure iframes are wrapped in figure tags for Ghost
-        var parent = iframe.ParentNode;
-        if (parent.Name == "figure") continue;
-        var figureHtml = $"""<figure class="kg-card kg-embed-card">{iframe.OuterHtml}</figure>""";
-        var figureNode = HtmlNode.CreateNode(figureHtml);
-        parent.ReplaceChild(figureNode, iframe);
-        videosProcessed++;
-    }
-
-    // NOTE: We do NOT process plain text URLs - if someone wrote a URL as plain text, keep it as-is
-    // Only actual embedded elements (iframes, video tags) are processed above
-
-    if (videosProcessed > 0)
-        Console.WriteLine($"  Processed {videosProcessed} video(s)");
-
-    // Get the final HTML and replace placeholders with actual video HTML (including comments)
-    var result = doc.DocumentNode.OuterHtml;
-    foreach (var (placeholder, videoHtml) in videoReplacements)
-    {
-        result = result.Replace($"<span>{placeholder}</span>", videoHtml);
-    }
-
-    return result;
-}
-
-async Task<string> ProcessFileLinks(string content, GhostAdminClient client)
-{
-    var doc = new HtmlDocument();
-    doc.LoadHtml(content);
-    var filesProcessed = 0;
-
-    // Pattern to match internal WordPress storage URLs
-    const string internalStoragePattern = @"https?://holographica\.space/wp-content/uploads/[^\s""'<>]+";
-
-    // Find all anchor tags that link to internal files
-    // IMPORTANT: Skip anchors inside <video> elements (they are fallback content, not real links)
-    var anchorNodes = doc.DocumentNode.SelectNodes("//a[@href][not(ancestor::video)]");
-    if (anchorNodes != null)
-    foreach (var anchor in anchorNodes.ToList())
-    {
-        var href = anchor.GetAttributeValue("href", "");
-        if (string.IsNullOrEmpty(href)) continue;
-
-        // Check if this is an internal storage link (not an image - those are handled separately)
-        if (Regex.IsMatch(href, internalStoragePattern, RegexOptions.IgnoreCase))
-        {
-            var ext = Path.GetExtension(href).TrimEnd('?', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '=', '_').ToLower();
-            // Skip image files - they're handled by the image processor
-            if (ext is ".jpg" or ".jpeg" or ".png" or ".gif" or ".webp" or ".svg")
-                continue;
-            // Skip video files - they're handled by the video processor
-            if (ext is ".mp4" or ".webm" or ".ogg" or ".mov")
-                continue;
-
-            try
-            {
-                var uploadedUrl = await client.UploadFileAsync(href);
-                if (!string.IsNullOrEmpty(uploadedUrl))
-                {
-                    anchor.SetAttributeValue("href", uploadedUrl);
-                    filesProcessed++;
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"  Failed to upload file {href}: {ex.Message}");
-            }
-        }
-    }
-
-    if (filesProcessed > 0)
-        Console.WriteLine($"  Processed {filesProcessed} file link(s)");
-
-    return doc.DocumentNode.OuterHtml;
-}
-
-string ProcessTablePressTables(string content)
-{
-    // First, replace any remaining TablePress shortcodes with empty string (they won't render anyway)
-    content = Regex.Replace(content, @"\[table\s+id=[^\]]+\s*/?\]", "", RegexOptions.IgnoreCase);
-    content = Regex.Replace(content, @"\[tablepress\s+id=[^\]]+\s*/?\]", "", RegexOptions.IgnoreCase);
-    content = Regex.Replace(content, @"\[/table\]", "", RegexOptions.IgnoreCase);
-    content = Regex.Replace(content, @"\[/tablepress\]", "", RegexOptions.IgnoreCase);
-
-    var doc = new HtmlDocument();
-    doc.LoadHtml(content);
-    var tablesProcessed = 0;
-
-    // Find all TablePress tables
-    var tablePressNodes = doc.DocumentNode.SelectNodes("//table[contains(@class, 'tablepress')]");
-    if (tablePressNodes == null)
-        return doc.DocumentNode.OuterHtml;
-
-    foreach (var table in tablePressNodes.ToList())
-    {
-        // Create a clean Ghost-compatible table
-        var newTable = doc.CreateElement("table");
-
-        // Process thead if exists
-        var thead = table.SelectSingleNode(".//thead");
-        if (thead != null)
-        {
-            var newThead = doc.CreateElement("thead");
-            var headerRows = thead.SelectNodes(".//tr");
-            if (headerRows != null)
-            foreach (var row in headerRows)
-            {
-                var newRow = doc.CreateElement("tr");
-                var cells = row.SelectNodes(".//th|.//td");
-                if (cells != null)
-                foreach (var cell in cells)
-                {
-                    var newCell = doc.CreateElement("th");
-                    newCell.InnerHtml = cell.InnerHtml.Trim();
-                    var colspan = cell.GetAttributeValue("colspan", "");
-                    var rowspan = cell.GetAttributeValue("rowspan", "");
-                    if (!string.IsNullOrEmpty(colspan)) newCell.SetAttributeValue("colspan", colspan);
-                    if (!string.IsNullOrEmpty(rowspan)) newCell.SetAttributeValue("rowspan", rowspan);
-                    newRow.AppendChild(newCell);
-                }
-                newThead.AppendChild(newRow);
-            }
-            newTable.AppendChild(newThead);
-        }
-
-        // Process tbody
-        var tbody = table.SelectSingleNode(".//tbody");
-        if (tbody != null)
-        {
-            var newTbody = doc.CreateElement("tbody");
-            var bodyRows = tbody.SelectNodes(".//tr");
-            if (bodyRows != null)
-            foreach (var row in bodyRows)
-            {
-                var newRow = doc.CreateElement("tr");
-                var cells = row.SelectNodes(".//td|.//th");
-                if (cells != null)
-                foreach (var cell in cells)
-                {
-                    var newCell = doc.CreateElement("td");
-                    newCell.InnerHtml = cell.InnerHtml.Trim();
-                    var colspan = cell.GetAttributeValue("colspan", "");
-                    var rowspan = cell.GetAttributeValue("rowspan", "");
-                    if (!string.IsNullOrEmpty(colspan)) newCell.SetAttributeValue("colspan", colspan);
-                    if (!string.IsNullOrEmpty(rowspan)) newCell.SetAttributeValue("rowspan", rowspan);
-                    newRow.AppendChild(newCell);
-                }
-                newTbody.AppendChild(newRow);
-            }
-            newTable.AppendChild(newTbody);
-        }
-
-        // Process tfoot if exists
-        var tfoot = table.SelectSingleNode(".//tfoot");
-        if (tfoot != null)
-        {
-            var newTfoot = doc.CreateElement("tfoot");
-            var footerRows = tfoot.SelectNodes(".//tr");
-            if (footerRows != null)
-            foreach (var row in footerRows)
-            {
-                var newRow = doc.CreateElement("tr");
-                var cells = row.SelectNodes(".//td|.//th");
-                if (cells != null)
-                foreach (var cell in cells)
-                {
-                    var newCell = doc.CreateElement("td");
-                    newCell.InnerHtml = cell.InnerHtml.Trim();
-                    var colspan = cell.GetAttributeValue("colspan", "");
-                    var rowspan = cell.GetAttributeValue("rowspan", "");
-                    if (!string.IsNullOrEmpty(colspan)) newCell.SetAttributeValue("colspan", colspan);
-                    if (!string.IsNullOrEmpty(rowspan)) newCell.SetAttributeValue("rowspan", rowspan);
-                    newRow.AppendChild(newCell);
-                }
-                newTfoot.AppendChild(newRow);
-            }
-            newTable.AppendChild(newTfoot);
-        }
-
-        // Find the wrapper div if it exists and replace the whole thing
-        var parent = table.ParentNode;
-        if (parent != null && parent.Name == "div" &&
-            (parent.GetAttributeValue("class", "").Contains("tablepress") ||
-             parent.GetAttributeValue("class", "").Contains("tablepress-scroll-wrapper")))
-        {
-            // Replace the wrapper div with the clean table
-            parent.ParentNode?.ReplaceChild(newTable, parent);
-        }
-        else
-        {
-            // Just replace the table
-            parent?.ReplaceChild(newTable, table);
-        }
-
-        tablesProcessed++;
-    }
-
-    // Also clean up any empty TablePress wrapper divs that might remain
-    var wrapperDivs = doc.DocumentNode.SelectNodes("//div[contains(@class, 'tablepress-scroll-wrapper')]");
-    if (wrapperDivs != null)
-    foreach (var wrapper in wrapperDivs.ToList())
-    {
-        // If it just contains a table, unwrap it
-        var innerTable = wrapper.SelectSingleNode(".//table");
-        if (innerTable != null)
-            wrapper.ParentNode?.ReplaceChild(innerTable, wrapper);
-    }
-
-    if (tablesProcessed > 0)
-        Console.WriteLine($"  Processed {tablesProcessed} TablePress table(s)");
-
-    return doc.DocumentNode.OuterHtml;
-}
+// =============================================================================
+// MODELS
+// =============================================================================
 
 class IdOnly
 {
     [JsonProperty("id")] public int Id { get; set; }
 }
 
-// Ghost API client
-public class GhostAdminClient
+public class MediaItem
 {
-    private readonly HttpClient _http;
-    private readonly string _baseUrl;
-    private readonly string _keyId;
-    private readonly byte[] _keySecret;
+    [JsonProperty("id")] public int Id { get; set; }
+    [JsonProperty("source_url")] public string SourceUrl { get; set; } = "";
+}
 
-    public GhostAdminClient(string baseUrl, string adminApiKey)
+public class MediaCacheItem
+{
+    public int Id { get; set; }
+    public string Url { get; set; } = "";
+}
+
+// =============================================================================
+// HTTP RETRY HANDLER
+// =============================================================================
+
+public class RetryHandler : DelegatingHandler
+{
+    public int MaxRetries { get; set; } = 3;
+
+    public RetryHandler(HttpMessageHandler innerHandler) : base(innerHandler) { }
+
+    protected override async Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken)
     {
-        _baseUrl = baseUrl.TrimEnd('/');
-        _http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        HttpResponseMessage? response = null;
 
-        var parts = adminApiKey.Split(':');
-        _keyId = parts[0];
-        _keySecret = Convert.FromHexString(parts[1]);
-    }
-
-    private string GenerateToken()
-    {
-        var now = DateTime.UtcNow;
-        var key = new SymmetricSecurityKey(_keySecret) { KeyId = _keyId };
-        var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
-
-        var header = new JwtHeader(credentials)
-        {
-            ["kid"] = _keyId
-        };
-
-        var payload = new JwtPayload(
-            issuer: null,
-            audience: "/admin/",
-            claims: null,
-            notBefore: null,
-            expires: now.AddMinutes(5),
-            issuedAt: now);
-
-        var token = new JwtSecurityToken(header, payload);
-        return new JwtSecurityTokenHandler().WriteToken(token);
-    }
-
-    private HttpRequestMessage CreateRequest(HttpMethod method, string endpoint)
-    {
-        var request = new HttpRequestMessage(method, $"{_baseUrl}/ghost/api/admin/{endpoint}");
-        request.Headers.Authorization = new AuthenticationHeaderValue("Ghost", GenerateToken());
-        return request;
-    }
-
-    private async Task<T?> RetryAsync<T>(Func<Task<T?>> action, int maxRetries = 3, string? context = null)
-    {
-        for (var attempt = 1; attempt <= maxRetries; attempt++)
+        for (var i = 0; i <= MaxRetries; i++)
         {
             try
             {
-                return await action();
-            }
-            catch (HttpRequestException ex) when (attempt < maxRetries)
-            {
-                var delay = attempt * 2; // 2s, 4s, 6s
-                Console.WriteLine($"  Network error{(context != null ? $" ({context})" : "")}: {ex.Message}. Retrying in {delay}s... (attempt {attempt}/{maxRetries})");
-                await Task.Delay(TimeSpan.FromSeconds(delay));
-            }
-        }
-        return default;
-    }
+                // Clone the request for retries (request can only be sent once)
+                var clonedRequest = await CloneRequest(request);
+                response = await base.SendAsync(clonedRequest, cancellationToken);
 
-    public async Task<List<GhostPost>> GetAllPostsAsync()
-    {
-        var posts = new List<GhostPost>();
-        var page = 1;
+                if (response.IsSuccessStatusCode)
+                    return response;
 
-        while (true)
-        {
-            var request = CreateRequest(HttpMethod.Get, $"posts/?limit=100&page={page}");
-            var response = await _http.SendAsync(request);
-            var json = await response.Content.ReadAsStringAsync();
-
-            if (!response.IsSuccessStatusCode)
-            {
-                Console.WriteLine($"Error getting posts: {json}");
-                break;
-            }
-
-            var result = JObject.Parse(json);
-            var pagePosts = result["posts"]?.ToObject<List<GhostPost>>() ?? [];
-
-            if (pagePosts.Count == 0) break;
-
-            posts.AddRange(pagePosts);
-            page++;
-        }
-
-        return posts;
-    }
-
-    public async Task<List<GhostTag>> GetAllTagsAsync()
-    {
-        var request = CreateRequest(HttpMethod.Get, "tags/?limit=all");
-        var response = await _http.SendAsync(request);
-        var json = await response.Content.ReadAsStringAsync();
-
-        if (!response.IsSuccessStatusCode)
-        {
-            Console.WriteLine($"Error getting tags: {json}");
-            return [];
-        }
-
-        var result = JObject.Parse(json);
-        return result["tags"]?.ToObject<List<GhostTag>>() ?? [];
-    }
-
-    public async Task<GhostTag?> CreateTagAsync(string slug, string name)
-    {
-        return await RetryAsync(async () =>
-        {
-            var request = CreateRequest(HttpMethod.Post, "tags/");
-            var payload = new { tags = new[] { new { slug, name } } };
-            request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
-
-            var response = await _http.SendAsync(request);
-            var json = await response.Content.ReadAsStringAsync();
-
-            if (!response.IsSuccessStatusCode)
-            {
-                Console.WriteLine($"Error creating tag {slug}: {json}");
-                return null;
-            }
-
-            var result = JObject.Parse(json);
-            return result["tags"]?[0]?.ToObject<GhostTag>();
-        }, context: $"creating tag {slug}");
-    }
-
-    public async Task<List<GhostAuthor>> GetAllAuthorsAsync()
-    {
-        var request = CreateRequest(HttpMethod.Get, "users/?limit=all");
-        var response = await _http.SendAsync(request);
-        var json = await response.Content.ReadAsStringAsync();
-
-        if (!response.IsSuccessStatusCode)
-        {
-            Console.WriteLine($"Error getting authors: {json}");
-            return [];
-        }
-
-        var result = JObject.Parse(json);
-        return result["users"]?.ToObject<List<GhostAuthor>>() ?? [];
-    }
-
-    public async Task<GhostPost?> CreatePostAsync(GhostPost post)
-    {
-        // Truncate excerpt to 300 chars max
-        var excerpt = post.CustomExcerpt;
-        if (excerpt?.Length > 300)
-            excerpt = excerpt[..297] + "...";
-
-        var postData = new Dictionary<string, object?>
-        {
-            ["title"] = post.Title,
-            ["slug"] = post.Slug,
-            ["html"] = post.Html,
-            ["status"] = post.Status,
-            ["custom_excerpt"] = excerpt,
-            ["published_at"] = post.PublishedAt?.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
-            ["feature_image"] = post.FeatureImage,
-            ["tags"] = post.Tags?.Select(t => new { id = t.Id, slug = t.Slug, name = t.Name }).ToArray(),
-            ["authors"] = post.Authors?.Select(a => new { id = a.Id }).ToArray()
-        };
-
-        return await RetryAsync(async () =>
-        {
-            var request = CreateRequest(HttpMethod.Post, "posts/?source=html");
-            var payload = new { posts = new[] { postData } };
-            request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
-
-            var response = await _http.SendAsync(request);
-            var json = await response.Content.ReadAsStringAsync();
-
-            if (!response.IsSuccessStatusCode)
-            {
-                Console.WriteLine($"Error creating post {post.Slug}: {json}");
-                return null;
-            }
-
-            var result = JObject.Parse(json);
-            return result["posts"]?[0]?.ToObject<GhostPost>();
-        }, context: $"creating post {post.Slug}");
-    }
-
-    [SuppressMessage("ReSharper", "PossibleLossOfFraction")]
-    public async Task<string?> UploadImageAsync(string imageUrl)
-    {
-        try
-        {
-            var fileName = Path.GetFileName(new Uri(imageUrl).LocalPath);
-            fileName = Regex.Replace(fileName, @"[^\u0000-\u007F]+", "");
-            if (fileName.Length > 100) fileName = fileName[..100] + Path.GetExtension(fileName);
-
-            // Download image with progress
-            Console.Write($"  Downloading: {fileName}");
-            var downloadStart = DateTime.Now;
-
-            using var downloadResponse = await _http.GetAsync(imageUrl, HttpCompletionOption.ResponseHeadersRead);
-            var totalBytes = downloadResponse.Content.Headers.ContentLength ?? 0;
-            Console.Write($" ({totalBytes / 1024}KB)");
-
-            await using var downloadStream = await downloadResponse.Content.ReadAsStreamAsync();
-            using var memoryStream = new MemoryStream();
-            var buffer = new byte[81920];
-            int bytesRead;
-            long totalRead = 0;
-
-            while ((bytesRead = await downloadStream.ReadAsync(buffer)) > 0)
-            {
-                await memoryStream.WriteAsync(buffer.AsMemory(0, bytesRead));
-                totalRead += bytesRead;
-                if (totalBytes <= 0) continue;
-                var percent = (int)(totalRead * 100 / totalBytes);
-                var elapsed = (DateTime.Now - downloadStart).TotalSeconds;
-                var speed = elapsed > 0 ? totalRead / 1024 / elapsed : 0;
-                Console.Write($"\r  Downloading: {fileName} ({totalBytes / 1024}KB) {percent}% @ {speed:F0}KB/s    ");
-            }
-
-            var downloadTime = (DateTime.Now - downloadStart).TotalSeconds;
-            var downloadSpeed = downloadTime > 0 ? totalRead / 1024 / downloadTime : 0;
-            Console.WriteLine($"\r  Downloaded: {fileName} ({totalRead / 1024}KB) @ {downloadSpeed:F0}KB/s              ");
-
-            var imageBytes = memoryStream.ToArray();
-
-            // Upload to Ghost with progress
-            Console.Write($"  Uploading: {fileName} ({imageBytes.Length / 1024}KB)");
-            var uploadStart = DateTime.Now;
-
-            var request = CreateRequest(HttpMethod.Post, "images/upload/");
-
-            using var content = new MultipartFormDataContent();
-            var fileContent = new ByteArrayContent(imageBytes);
-            fileContent.Headers.ContentType = new MediaTypeHeaderValue(GetMimeType(fileName));
-            content.Add(fileContent, "file", fileName);
-
-            request.Content = content;
-
-            var response = await _http.SendAsync(request);
-            var uploadTime = (DateTime.Now - uploadStart).TotalSeconds;
-            var uploadSpeed = uploadTime > 0 ? imageBytes.Length / 1024 / uploadTime : 0;
-
-            var json = await response.Content.ReadAsStringAsync();
-
-            if (!response.IsSuccessStatusCode)
-            {
-                Console.WriteLine($"\r  Upload failed: {fileName} - {json}                    ");
-                return null;
-            }
-
-            var result = JObject.Parse(json);
-            var uploadedUrl = result["images"]?[0]?["url"]?.ToString();
-            Console.WriteLine($"\r  Uploaded: {fileName} ({imageBytes.Length / 1024}KB) @ {uploadSpeed:F0}KB/s              ");
-            return uploadedUrl;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"\n  Error: {ex.Message}");
-            return null;
-        }
-    }
-
-    private static string GetMimeType(string fileName)
-    {
-        var ext = Path.GetExtension(fileName).ToLower();
-        return ext switch
-        {
-            ".jpg" or ".jpeg" => "image/jpeg",
-            ".png" => "image/png",
-            ".gif" => "image/gif",
-            ".webp" => "image/webp",
-            ".svg" => "image/svg+xml",
-            ".pdf" => "application/pdf",
-            ".doc" => "application/msword",
-            ".docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            ".xls" => "application/vnd.ms-excel",
-            ".xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            ".ppt" => "application/vnd.ms-powerpoint",
-            ".pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            ".zip" => "application/zip",
-            ".rar" => "application/vnd.rar",
-            ".txt" => "text/plain",
-            ".csv" => "text/csv",
-            ".mp4" => "video/mp4",
-            ".webm" => "video/webm",
-            ".ogg" => "video/ogg",
-            ".mov" => "video/quicktime",
-            _ => "application/octet-stream"
-        };
-    }
-
-    [SuppressMessage("ReSharper", "PossibleLossOfFraction")]
-    public async Task<string?> UploadVideoAsync(string videoUrl)
-    {
-        try
-        {
-            var fileName = Path.GetFileName(new Uri(videoUrl).LocalPath);
-            fileName = Regex.Replace(fileName, @"[^\u0000-\u007F]+", "");
-            if (fileName.Length > 100) fileName = fileName[..100] + Path.GetExtension(fileName);
-
-            // Download video with progress
-            Console.Write($"  Downloading video: {fileName}");
-            var downloadStart = DateTime.Now;
-
-            using var downloadResponse = await _http.GetAsync(videoUrl, HttpCompletionOption.ResponseHeadersRead);
-            var totalBytes = downloadResponse.Content.Headers.ContentLength ?? 0;
-            Console.Write($" ({totalBytes / 1024}KB)");
-
-            await using var downloadStream = await downloadResponse.Content.ReadAsStreamAsync();
-            using var memoryStream = new MemoryStream();
-            var buffer = new byte[81920];
-            int bytesRead;
-            long totalRead = 0;
-
-            while ((bytesRead = await downloadStream.ReadAsync(buffer)) > 0)
-            {
-                await memoryStream.WriteAsync(buffer.AsMemory(0, bytesRead));
-                totalRead += bytesRead;
-                if (totalBytes > 0)
+                // Retry on server errors (5xx) and rate limiting (429)
+                if ((int)response.StatusCode >= 500 || response.StatusCode == HttpStatusCode.TooManyRequests)
                 {
-                    var percent = (int)(totalRead * 100 / totalBytes);
-                    var elapsed = (DateTime.Now - downloadStart).TotalSeconds;
-                    var speed = elapsed > 0 ? totalRead / 1024 / elapsed : 0;
-                    Console.Write($"\r  Downloading video: {fileName} ({totalBytes / 1024}KB) {percent}% @ {speed:F0}KB/s    ");
+                    if (i < MaxRetries)
+                    {
+                        var delay = (i + 1) * 2000; // 2s, 4s, 6s
+                        await Task.Delay(delay, cancellationToken);
+                        continue;
+                    }
                 }
+
+                return response;
             }
-
-            var downloadTime = (DateTime.Now - downloadStart).TotalSeconds;
-            var downloadSpeed = downloadTime > 0 ? totalRead / 1024 / downloadTime : 0;
-            Console.WriteLine($"\r  Downloaded video: {fileName} ({totalRead / 1024}KB) @ {downloadSpeed:F0}KB/s              ");
-
-            var videoBytes = memoryStream.ToArray();
-
-            // Upload to Ghost media endpoint
-            Console.Write($"  Uploading video: {fileName} ({videoBytes.Length / 1024}KB)");
-            var uploadStart = DateTime.Now;
-
-            var request = CreateRequest(HttpMethod.Post, "media/upload/");
-
-            using var content = new MultipartFormDataContent();
-            var fileContent = new ByteArrayContent(videoBytes);
-            fileContent.Headers.ContentType = new MediaTypeHeaderValue(GetMimeType(fileName));
-            content.Add(fileContent, "file", fileName);
-
-            request.Content = content;
-
-            var response = await _http.SendAsync(request);
-            var uploadTime = (DateTime.Now - uploadStart).TotalSeconds;
-            var uploadSpeed = uploadTime > 0 ? videoBytes.Length / 1024 / uploadTime : 0;
-
-            var json = await response.Content.ReadAsStringAsync();
-
-            if (!response.IsSuccessStatusCode)
+            catch (HttpRequestException) when (i < MaxRetries)
             {
-                Console.WriteLine($"\r  Upload failed: {fileName} - {json}                    ");
-                return null;
+                var delay = (i + 1) * 2000;
+                await Task.Delay(delay, cancellationToken);
             }
+        }
 
-            var result = JObject.Parse(json);
-            var uploadedUrl = result["media"]?[0]?["url"]?.ToString();
-            Console.WriteLine($"\r  Uploaded video: {fileName} ({videoBytes.Length / 1024}KB) @ {uploadSpeed:F0}KB/s              ");
-            return uploadedUrl;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"\n  Error uploading video: {ex.Message}");
-            return null;
-        }
+        return response ?? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
     }
 
-    [SuppressMessage("ReSharper", "PossibleLossOfFraction")]
-    public async Task<string?> UploadFileAsync(string fileUrl)
+    private static async Task<HttpRequestMessage> CloneRequest(HttpRequestMessage request)
     {
-        try
+        var clone = new HttpRequestMessage(request.Method, request.RequestUri);
+
+        if (request.Content != null)
         {
-            var fileName = Path.GetFileName(new Uri(fileUrl).LocalPath);
-            fileName = Regex.Replace(fileName, @"[^\u0000-\u007F]+", "");
-            if (fileName.Length > 100) fileName = fileName[..100] + Path.GetExtension(fileName);
+            var content = await request.Content.ReadAsByteArrayAsync();
+            clone.Content = new ByteArrayContent(content);
 
-            // Download file with progress
-            Console.Write($"  Downloading file: {fileName}");
-            var downloadStart = DateTime.Now;
-
-            using var downloadResponse = await _http.GetAsync(fileUrl, HttpCompletionOption.ResponseHeadersRead);
-            var totalBytes = downloadResponse.Content.Headers.ContentLength ?? 0;
-            Console.Write($" ({totalBytes / 1024}KB)");
-
-            await using var downloadStream = await downloadResponse.Content.ReadAsStreamAsync();
-            using var memoryStream = new MemoryStream();
-            var buffer = new byte[81920];
-            int bytesRead;
-            long totalRead = 0;
-
-            while ((bytesRead = await downloadStream.ReadAsync(buffer)) > 0)
+            foreach (var header in request.Content.Headers)
             {
-                await memoryStream.WriteAsync(buffer.AsMemory(0, bytesRead));
-                totalRead += bytesRead;
-                if (totalBytes > 0)
-                {
-                    var percent = (int)(totalRead * 100 / totalBytes);
-                    var elapsed = (DateTime.Now - downloadStart).TotalSeconds;
-                    var speed = elapsed > 0 ? totalRead / 1024 / elapsed : 0;
-                    Console.Write($"\r  Downloading file: {fileName} ({totalBytes / 1024}KB) {percent}% @ {speed:F0}KB/s    ");
-                }
+                clone.Content.Headers.TryAddWithoutValidation(header.Key, header.Value);
             }
-
-            var downloadTime = (DateTime.Now - downloadStart).TotalSeconds;
-            var downloadSpeed = downloadTime > 0 ? totalRead / 1024 / downloadTime : 0;
-            Console.WriteLine($"\r  Downloaded file: {fileName} ({totalRead / 1024}KB) @ {downloadSpeed:F0}KB/s              ");
-
-            var fileBytes = memoryStream.ToArray();
-
-            // Upload to Ghost with progress
-            Console.Write($"  Uploading file: {fileName} ({fileBytes.Length / 1024}KB)");
-            var uploadStart = DateTime.Now;
-
-            var request = CreateRequest(HttpMethod.Post, "files/upload/");
-
-            using var content = new MultipartFormDataContent();
-            var fileContent = new ByteArrayContent(fileBytes);
-            fileContent.Headers.ContentType = new MediaTypeHeaderValue(GetMimeType(fileName));
-            content.Add(fileContent, "file", fileName);
-
-            request.Content = content;
-
-            var response = await _http.SendAsync(request);
-            var uploadTime = (DateTime.Now - uploadStart).TotalSeconds;
-            var uploadSpeed = uploadTime > 0 ? fileBytes.Length / 1024 / uploadTime : 0;
-
-            var json = await response.Content.ReadAsStringAsync();
-
-            if (!response.IsSuccessStatusCode)
-            {
-                Console.WriteLine($"\r  Upload failed: {fileName} - {json}                    ");
-                return null;
-            }
-
-            var result = JObject.Parse(json);
-            var uploadedUrl = result["files"]?[0]?["url"]?.ToString();
-            Console.WriteLine($"\r  Uploaded file: {fileName} ({fileBytes.Length / 1024}KB) @ {uploadSpeed:F0}KB/s              ");
-            return uploadedUrl;
         }
-        catch (Exception ex)
+
+        foreach (var header in request.Headers)
         {
-            Console.WriteLine($"\n  Error uploading file: {ex.Message}");
-            return null;
+            clone.Headers.TryAddWithoutValidation(header.Key, header.Value);
         }
+
+        return clone;
     }
-}
-
-// Ghost models
-public class GhostPost
-{
-    [JsonProperty("id")] public string Id { get; set; } = "";
-    [JsonProperty("title")] public string Title { get; set; } = "";
-    [JsonProperty("slug")] public string Slug { get; set; } = "";
-    [JsonProperty("html")] public string? Html { get; set; }
-    [JsonProperty("custom_excerpt")] public string? CustomExcerpt { get; set; }
-    [JsonProperty("status")] public string Status { get; set; } = "draft";
-    [JsonProperty("published_at")] public DateTime? PublishedAt { get; set; }
-    [JsonProperty("feature_image")] public string? FeatureImage { get; set; }
-    [JsonProperty("tags")] public List<GhostTag>? Tags { get; set; }
-    [JsonProperty("authors")] public List<GhostAuthor>? Authors { get; set; }
-}
-
-public class GhostTag
-{
-    [JsonProperty("id")] public string Id { get; set; } = "";
-    [JsonProperty("slug")] public string Slug { get; set; } = "";
-    [JsonProperty("name")] public string Name { get; set; } = "";
-}
-
-public class GhostAuthor
-{
-    [JsonProperty("id")] public string Id { get; set; } = "";
-    [JsonProperty("slug")] public string Slug { get; set; } = "";
-    [JsonProperty("name")] public string Name { get; set; } = "";
-    [JsonProperty("email")] public string? Email { get; set; }
 }
