@@ -8,6 +8,7 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using WordPressPCL;
 using WordPressPCL.Models;
+// ReSharper disable NullCoalescingConditionIsAlwaysNotNullAccordingToAPIContract
 
 // =============================================================================
 // CONFIGURATION
@@ -499,8 +500,11 @@ async Task MigratePost(Post sourcePost)
         }
     }
 
-    // 6. Get custom fields (meta) from source post
-    var customMeta = await GetPostMeta(sourcePost.Id);
+    // 6. Get custom fields (meta) from source post - only post_views and thumbnail
+    var allMeta = await GetPostMeta(sourcePost.Id);
+    var customMeta = allMeta?
+        .Where(kv => kv.Key.StartsWith("post_view") || kv.Key == "_thumbnail_id")
+        .ToDictionary(kv => kv.Key, kv => kv.Value);
 
     // 7. Prepare excerpt
     var excerpt = sourcePost.Excerpt.Rendered;
@@ -592,14 +596,13 @@ async Task UpdatePostMeta(int postId, Dictionary<string, object> meta)
 // =============================================================================
 // MEDIA HANDLING
 // =============================================================================
-
 async Task<string> ProcessContentMedia(string content)
 {
     var doc = new HtmlDocument();
     doc.LoadHtml(content);
 
     // Process images
-    foreach (var img in doc.DocumentNode.SelectNodes("//img[@src]"))
+    foreach (var img in doc.DocumentNode.SelectNodes("//img[@src]") ?? Enumerable.Empty<HtmlNode>())
     {
         var src = img.GetAttributeValue("src", "");
         if (string.IsNullOrEmpty(src) || !IsSourceMedia(src)) continue;
@@ -612,7 +615,7 @@ async Task<string> ProcessContentMedia(string content)
     }
 
     // Process video sources
-    foreach (var source in doc.DocumentNode.SelectNodes("//video//source[@src] | //video[@src]"))
+    foreach (var source in doc.DocumentNode.SelectNodes("//video//source[@src] | //video[@src]") ?? Enumerable.Empty<HtmlNode>())
     {
         var src = source.GetAttributeValue("src", "");
         if (string.IsNullOrEmpty(src) || !IsSourceMedia(src)) continue;
@@ -625,7 +628,7 @@ async Task<string> ProcessContentMedia(string content)
     }
 
     // Process anchor links to media files
-    foreach (var anchor in doc.DocumentNode.SelectNodes("//a[@href]"))
+    foreach (var anchor in doc.DocumentNode.SelectNodes("//a[@href]") ?? Enumerable.Empty<HtmlNode>())
     {
         var href = anchor.GetAttributeValue("href", "");
         if (string.IsNullOrEmpty(href) || !IsSourceMedia(href)) continue;
@@ -807,7 +810,7 @@ string CleanupHtml(string content)
     doc.LoadHtml(content);
 
     // Clean up TablePress tables
-    foreach (var table in doc.DocumentNode.SelectNodes("//table[contains(@class, 'tablepress')]"))
+    foreach (var table in doc.DocumentNode.SelectNodes("//table[contains(@class, 'tablepress')]") ?? Enumerable.Empty<HtmlNode>())
     {
         // Remove TablePress-specific classes but keep the table
         var currentClass = table.GetAttributeValue("class", "");
@@ -829,7 +832,7 @@ string CleanupHtml(string content)
     }
 
     // Remove TablePress wrapper divs
-    foreach (var wrapper in (doc.DocumentNode.SelectNodes("//div[contains(@class, 'tablepress-scroll-wrapper')]")).ToList())
+    foreach (var wrapper in (doc.DocumentNode.SelectNodes("//div[contains(@class, 'tablepress-scroll-wrapper')]") ?? Enumerable.Empty<HtmlNode>()).ToList())
     {
         var innerContent = wrapper.InnerHtml;
         var textNode = HtmlNode.CreateNode(innerContent);
@@ -837,7 +840,7 @@ string CleanupHtml(string content)
     }
 
     // Wrap standalone iframes in figure tags
-    foreach (var iframe in (doc.DocumentNode.SelectNodes("//iframe[not(ancestor::figure)]")).ToList())
+    foreach (var iframe in (doc.DocumentNode.SelectNodes("//iframe[not(ancestor::figure)]") ?? Enumerable.Empty<HtmlNode>()).ToList())
     {
         var figure = doc.CreateElement("figure");
         figure.SetAttributeValue("class", "wp-block-embed");
