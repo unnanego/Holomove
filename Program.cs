@@ -59,8 +59,10 @@ var targetTagsDict = new Dictionary<string, Tag>();
 var targetAuthorsDict = new Dictionary<string, User>();
 var targetCategoriesDict = new Dictionary<string, Category>();
 
-// Media upload cache (source URL -> target MediaItem) to avoid re-uploading
-var mediaCache = new Dictionary<string, MediaCacheItem>();
+// Target media lookup (URL -> MediaItem)
+var targetMediaByUrl = new Dictionary<string, MediaItem>(StringComparer.OrdinalIgnoreCase);
+var targetMediaByFilename = new Dictionary<string, MediaItem>(StringComparer.OrdinalIgnoreCase);
+
 
 // =============================================================================
 // MAIN EXECUTION
@@ -68,13 +70,14 @@ var mediaCache = new Dictionary<string, MediaCacheItem>();
 
 await AuthenticateTargetWp();
 await LoadCache();
+await DownloadTargetMediaList();
 await DownloadAllPostsAndCompare();
 await DeleteDuplicatePosts();
 await MigrateAuthors();
 await UpdateExistingPostsAuthors();
 await ProcessPosts();
+await VerifyAndFixExistingPostsMedia(); // Fix featured images and media attachments
 await SaveCache();
-await GenerateRedirects();
 
 Console.WriteLine("\nMigration complete!");
 return;
@@ -140,6 +143,66 @@ HttpRequestMessage CreateAuthenticatedRequest(HttpMethod method, string url)
 }
 
 // =============================================================================
+// TARGET MEDIA LIST
+// =============================================================================
+
+async Task DownloadTargetMediaList()
+{
+    Console.WriteLine("\nDownloading target media list...");
+    var page = 1;
+    var totalMedia = 0;
+
+    while (true)
+    {
+        try
+        {
+            var url = $"{targetWpApiUrl}wp/v2/media?per_page=100&page={page}&_fields=id,source_url";
+            var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
+            var response = await httpClient.SendAsync(request);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                if (response.StatusCode == System.Net.HttpStatusCode.BadRequest)
+                    break;
+                Console.WriteLine($"\n  Error fetching page {page}: {response.StatusCode}");
+                break;
+            }
+
+            var json = await response.Content.ReadAsStringAsync();
+            var mediaItems = JsonConvert.DeserializeObject<List<MediaItem>>(json) ?? [];
+
+            if (mediaItems.Count == 0) break;
+
+            foreach (var media in mediaItems)
+            {
+                if (!string.IsNullOrEmpty(media.SourceUrl))
+                {
+                    targetMediaByUrl[media.SourceUrl] = media;
+
+                    // Also index by filename for flexible matching
+                    var filename = Path.GetFileName(new Uri(media.SourceUrl).LocalPath);
+                    if (!string.IsNullOrEmpty(filename))
+                    {
+                        targetMediaByFilename[filename] = media;
+                    }
+                }
+                totalMedia++;
+            }
+
+            Console.Write($"\r  Downloaded: {totalMedia} media items (page {page})          ");
+            page++;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\n  Error on page {page}: {ex.Message}");
+            break;
+        }
+    }
+
+    Console.WriteLine($"\n  Total media indexed: {targetMediaByUrl.Count} by URL, {targetMediaByFilename.Count} by filename");
+}
+
+// =============================================================================
 // CACHE MANAGEMENT
 // =============================================================================
 
@@ -155,11 +218,9 @@ async Task LoadCache()
     targetTags = await LoadFromCache<List<Tag>>("targetTags.json") ?? [];
     targetAuthors = await LoadFromCache<List<User>>("targetAuthors.json") ?? [];
     targetCategories = await LoadFromCache<List<Category>>("targetCategories.json") ?? [];
-    mediaCache = await LoadFromCache<Dictionary<string, MediaCacheItem>>("mediaCache.json") ?? [];
 
     Console.WriteLine($"  Source: {sourcePosts.Count} posts, {sourceTags.Count} tags, {sourceCategories.Count} categories");
     Console.WriteLine($"  Target: {targetPosts.Count} posts, {targetTags.Count} tags, {targetCategories.Count} categories");
-    Console.WriteLine($"  Media cache: {mediaCache.Count} items");
 }
 
 async Task SaveCache()
@@ -174,7 +235,6 @@ async Task SaveCache()
     await SaveToCache("targetTags.json", targetTags);
     await SaveToCache("targetAuthors.json", targetAuthors);
     await SaveToCache("targetCategories.json", targetCategories);
-    await SaveToCache("mediaCache.json", mediaCache);
 }
 
 async Task<T?> LoadFromCache<T>(string fileName) where T : class
@@ -222,8 +282,8 @@ async Task DownloadAllPostsAndCompare()
 
     // Fetch all post IDs from APIs
     Console.WriteLine("\nFetching post IDs from APIs...");
-    var apiSourceIds = await GetAllPostIds(sourceWpApiUrl);
-    var apiTargetIds = await GetAllPostIds(targetWpApiUrl);
+    var apiSourceIds = await GetAllPostIds(sourceWpApiUrl, useAuth: false);
+    var apiTargetIds = await GetAllPostIds(targetWpApiUrl, useAuth: true);
 
     Console.WriteLine($"\nAPI data:");
     Console.WriteLine($"  Source: {apiSourceIds.Count} posts");
@@ -307,6 +367,7 @@ async Task DownloadAllPostsAndCompare()
     if (missingSourceIds.Count > 0)
     {
         Console.WriteLine($"\nDownloading {missingSourceIds.Count} missing source posts...");
+        var count = 0;
         foreach (var (id, index) in missingSourceIds.Select((id, i) => (id, i)))
         {
             Console.Write($"\r  Progress: {index + 1}/{missingSourceIds.Count} (ID: {id})          ");
@@ -314,6 +375,13 @@ async Task DownloadAllPostsAndCompare()
             {
                 var post = await sourceWp.Posts.GetByIDAsync(id);
                 sourcePosts.Add(post);
+                count++;
+
+                // Save cache every 100 posts
+                if (count % 100 == 0)
+                {
+                    await SaveCache();
+                }
             }
             catch (Exception ex)
             {
@@ -321,25 +389,86 @@ async Task DownloadAllPostsAndCompare()
             }
         }
         Console.WriteLine();
+        await SaveCache();
     }
+
+    Console.WriteLine($"\nTarget posts to download: {missingTargetIds.Count}");
+    Console.WriteLine($"Target posts already in cache: {targetPosts.Count}");
 
     if (missingTargetIds.Count > 0)
     {
-        Console.WriteLine($"\nDownloading {missingTargetIds.Count} missing target posts...");
-        foreach (var (id, index) in missingTargetIds.Select((id, i) => (id, i)))
+        Console.WriteLine($"Downloading missing target posts in batches...");
+        var page = 1;
+
+        while (true)
         {
-            Console.Write($"\r  Progress: {index + 1}/{missingTargetIds.Count} (ID: {id})          ");
             try
             {
-                var post = await targetWp.Posts.GetByIDAsync(id);
-                targetPosts.Add(post);
+                var url = $"{targetWpApiUrl}wp/v2/posts?per_page=100&page={page}";
+                var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
+                var response = await httpClient.SendAsync(request);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    var errorContent = await response.Content.ReadAsStringAsync();
+                    Console.WriteLine($"\n  Error fetching page {page}: {response.StatusCode}");
+                    Console.WriteLine($"  Response: {errorContent.Substring(0, Math.Min(500, errorContent.Length))}");
+                    if (response.StatusCode == System.Net.HttpStatusCode.BadRequest)
+                        break; // No more pages
+                    break;
+                }
+
+                var json = await response.Content.ReadAsStringAsync();
+                var posts = JsonConvert.DeserializeObject<List<Post>>(json) ?? [];
+                if (posts.Count == 0)
+                {
+                    Console.WriteLine($"  Page {page}: empty, stopping");
+                    break;
+                }
+
+                foreach (var post in posts)
+                {
+                    if (!targetPosts.Any(p => p.Id == post.Id))
+                    {
+                        targetPosts.Add(post);
+                    }
+                }
+
+                Console.WriteLine($"  Page {page}: {posts.Count} posts, total in cache: {targetPosts.Count}");
+                page++;
+
+                // Save periodically
+                if (page % 10 == 0)
+                {
+                    await SaveCache();
+                }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"\n  Failed to download target post {id}: {ex.Message}");
+                Console.WriteLine($"\n  Error on page {page}: {ex.Message}");
+                break;
             }
         }
         Console.WriteLine();
+        await SaveCache();
+    }
+
+    Console.WriteLine($"\nCache state after downloads:");
+    Console.WriteLine($"  Source posts: {sourcePosts.Count}");
+    Console.WriteLine($"  Target posts: {targetPosts.Count}");
+
+    // Verify we have data
+    if (sourcePosts.Count == 0)
+    {
+        Console.WriteLine("\nERROR: No source posts loaded. Check source API connection.");
+        Environment.Exit(1);
+    }
+
+    if (apiTargetIds.Count > 0 && targetPosts.Count == 0)
+    {
+        Console.WriteLine($"\nERROR: API reports {apiTargetIds.Count} target posts but cache is empty.");
+        Console.WriteLine("Target post download failed. Check authentication and try again.");
+        Environment.Exit(1);
     }
 
     // ==========================================================================
@@ -514,7 +643,7 @@ async Task<List<T>?> FetchAllFromApi<T>(string endpoint)
     }
 }
 
-async Task<HashSet<int>> GetAllPostIds(string apiUrl)
+async Task<HashSet<int>> GetAllPostIds(string apiUrl, bool useAuth = false)
 {
     var allIds = new HashSet<int>();
     var page = 1;
@@ -525,7 +654,17 @@ async Task<HashSet<int>> GetAllPostIds(string apiUrl)
         {
             var url = $"{apiUrl}wp/v2/posts?_fields=id&per_page=100&page={page}";
             Console.WriteLine($"  Fetching: {url}");
-            var response = await httpClient.GetAsync(url);
+
+            HttpResponseMessage response;
+            if (useAuth)
+            {
+                var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
+                response = await httpClient.SendAsync(request);
+            }
+            else
+            {
+                response = await httpClient.GetAsync(url);
+            }
 
             var json = await response.Content.ReadAsStringAsync();
 
@@ -581,34 +720,82 @@ async Task DeleteDuplicatePosts()
         return;
     }
 
-    // Group by base slug AND date to find duplicates (WordPress appends -2, -3, etc. to duplicate slugs)
-    // Duplicates will have the same date since they were migrated from the same source post
-    var duplicateGroups = allTargetPosts
-        .GroupBy(p => (BaseSlug: GetBaseSlug(p.Slug), p.Date))
-        .Where(g => g.Count() > 1)
+    // Find WordPress duplicates: posts with -2, -3, etc. suffix where a base post exists
+    // WordPress appends -2, -3, etc. when creating posts with duplicate slugs
+    var slugSet = allTargetPosts.Select(p => p.Slug).ToHashSet();
+    var postsToDelete = new List<(int Id, string Slug)>();
+
+    // Group posts by their base slug to find families
+    var postsByBaseSlug = allTargetPosts
+        .GroupBy(p => GetBaseSlug(p.Slug))
+        .Where(g => g.Count() > 1) // Only groups with potential duplicates
         .ToList();
 
-    if (duplicateGroups.Count == 0)
+    if (postsByBaseSlug.Count == 0)
     {
         Console.WriteLine("No duplicate posts found.");
         return;
     }
 
-    Console.WriteLine($"Found {duplicateGroups.Count} slug(s) with duplicates:");
+    Console.WriteLine($"Found {postsByBaseSlug.Count} slug group(s) to check for duplicates:");
 
-    var postsToDelete = new List<(int Id, string Slug)>();
-
-    foreach (var group in duplicateGroups)
+    foreach (var group in postsByBaseSlug)
     {
-        var posts = group.OrderBy(p => p.Id).ToList(); // Keep the oldest (lowest ID)
-        var keepPost = posts.First();
-        var duplicates = posts.Skip(1).ToList();
+        var baseSlug = group.Key;
+        var posts = group.ToList();
 
-        Console.WriteLine($"  '{group.Key.BaseSlug}' ({group.Key.Date:yyyy-MM-dd}): keeping ID {keepPost.Id}, deleting {string.Join(", ", duplicates.Select(p => p.Id))}");
+        // Check if there's a base post (without suffix)
+        var basePost = posts.FirstOrDefault(p => p.Slug == baseSlug);
 
-        foreach (var dup in duplicates)
+        // Find posts that are clearly duplicates (have -N suffix where base exists or same date)
+        var duplicateSuffixPosts = posts
+            .Where(p => p.Slug != baseSlug && GetBaseSlug(p.Slug) == baseSlug)
+            .ToList();
+
+        if (duplicateSuffixPosts.Count == 0) continue;
+
+        // If we have a base post, duplicates are the suffix ones
+        // If no base post, check if suffix posts have the same date (meaning they're duplicates of each other)
+        List<PostSlugInfo> duplicates;
+        PostSlugInfo keepPost;
+
+        if (basePost != null)
         {
-            postsToDelete.Add((dup.Id, dup.Slug));
+            // Keep the base post, delete suffix posts with same date
+            keepPost = basePost;
+            duplicates = duplicateSuffixPosts
+                .Where(p => p.Date.Date == basePost.Date.Date)
+                .ToList();
+        }
+        else
+        {
+            // No base post - group suffix posts by date and keep oldest ID per date
+            var sameDate = duplicateSuffixPosts
+                .GroupBy(p => p.Date.Date)
+                .Where(g => g.Count() > 1)
+                .ToList();
+
+            if (sameDate.Count == 0) continue;
+
+            foreach (var dateGroup in sameDate)
+            {
+                var sorted = dateGroup.OrderBy(p => p.Id).ToList();
+                keepPost = sorted.First();
+                duplicates = sorted.Skip(1).ToList();
+
+                if (duplicates.Count > 0)
+                {
+                    Console.WriteLine($"  '{baseSlug}' ({dateGroup.Key:yyyy-MM-dd}): keeping ID {keepPost.Id} ({keepPost.Slug}), deleting {string.Join(", ", duplicates.Select(p => $"{p.Id} ({p.Slug})"))}");
+                    postsToDelete.AddRange(duplicates.Select(d => (d.Id, d.Slug)));
+                }
+            }
+            continue;
+        }
+
+        if (duplicates.Count > 0)
+        {
+            Console.WriteLine($"  '{baseSlug}' ({keepPost.Date.Date:yyyy-MM-dd}): keeping ID {keepPost.Id} ({keepPost.Slug}), deleting {string.Join(", ", duplicates.Select(p => $"{p.Id} ({p.Slug})"))}");
+            postsToDelete.AddRange(duplicates.Select(d => (d.Id, d.Slug)));
         }
     }
 
@@ -937,7 +1124,12 @@ async Task ProcessPosts(int? limit = null, string? slug = null)
     }
     else
     {
+        // Check exact slug match only
         var targetSlugs = targetPosts.Select(p => p.Slug).ToHashSet();
+
+        Console.WriteLine($"  Source posts: {sourcePosts.Count}");
+        Console.WriteLine($"  Target slugs in cache: {targetSlugs.Count}");
+
         postsToProcess = sourcePosts.Where(p => !targetSlugs.Contains(p.Slug));
 
         if (limit.HasValue)
@@ -948,11 +1140,11 @@ async Task ProcessPosts(int? limit = null, string? slug = null)
 
     if (postsList.Count == 0)
     {
-        Console.WriteLine("No posts to process.");
+        Console.WriteLine("No posts to process - all posts already migrated.");
         return;
     }
 
-    Console.WriteLine($"Processing {postsList.Count} post(s)...\n");
+    Console.WriteLine($"Processing {postsList.Count} post(s) that don't exist on target...\n");
 
     for (var i = 0; i < postsList.Count; i++)
     {
@@ -984,8 +1176,15 @@ async Task MigratePost(Post sourcePost)
         // Make sure it's in our local cache
         if (!targetPosts.Any(p => p.Id == existingPost.Id))
         {
-            var fullPost = await targetWp.Posts.GetByIDAsync(existingPost.Id);
-            targetPosts.Add(fullPost);
+            try
+            {
+                var fullPost = await targetWp.Posts.GetByIDAsync(existingPost.Id);
+                targetPosts.Add(fullPost);
+            }
+            catch
+            {
+                // Ignore - post exists but we couldn't fetch full details
+            }
         }
         return;
     }
@@ -1068,9 +1267,10 @@ async Task MigratePost(Post sourcePost)
         }
     }
 
-    // 3. Process content - migrate media
+    // 3. Process content - migrate media (track uploaded media IDs for later attachment)
+    var uploadedMediaIds = new List<int>();
     var content = sourcePost.Content.Rendered;
-    content = await ProcessContentMedia(content);
+    content = await ProcessContentMedia(content, uploadedMediaIds);
     content = ProcessShortcodes(content);
     content = CleanupHtml(content);
 
@@ -1154,7 +1354,24 @@ async Task MigratePost(Post sourcePost)
     var createdPost = await targetWp.Posts.CreateAsync(newPost);
     Console.WriteLine($"  Created post ID: {createdPost.Id}");
 
-    // 9. Update custom fields on target post
+    // 9. Attach all uploaded media to this post (including featured image)
+    if (featuredMediaId.HasValue)
+    {
+        uploadedMediaIds.Add(featuredMediaId.Value);
+    }
+
+    if (uploadedMediaIds.Count > 0)
+    {
+        // Remove duplicates in case featured image was also in content
+        var uniqueMediaIds = uploadedMediaIds.Distinct().ToList();
+        Console.WriteLine($"  Attaching {uniqueMediaIds.Count} media item(s) to post...");
+        foreach (var mediaId in uniqueMediaIds)
+        {
+            await AttachMediaToPost(mediaId, createdPost.Id);
+        }
+    }
+
+    // 10. Update custom fields on target post
     if (customMeta is { Count: > 0 })
     {
         Console.WriteLine($"  Custom fields: {string.Join(", ", customMeta.Keys)}");
@@ -1218,7 +1435,7 @@ async Task UpdatePostMeta(int postId, Dictionary<string, object> meta)
 // =============================================================================
 // MEDIA HANDLING
 // =============================================================================
-async Task<string> ProcessContentMedia(string content)
+async Task<string> ProcessContentMedia(string content, List<int>? uploadedMediaIds = null)
 {
     var doc = new HtmlDocument();
     doc.LoadHtml(content);
@@ -1234,6 +1451,7 @@ async Task<string> ProcessContentMedia(string content)
 
         img.SetAttributeValue("src", uploaded.SourceUrl);
         img.Attributes.Remove("srcset"); // Remove srcset to prevent broken responsive images
+        uploadedMediaIds?.Add(uploaded.Id);
     }
 
     // Process video sources
@@ -1246,6 +1464,7 @@ async Task<string> ProcessContentMedia(string content)
         if (uploaded != null)
         {
             source.SetAttributeValue("src", uploaded.SourceUrl);
+            uploadedMediaIds?.Add(uploaded.Id);
         }
     }
 
@@ -1262,6 +1481,7 @@ async Task<string> ProcessContentMedia(string content)
         if (uploaded != null)
         {
             anchor.SetAttributeValue("href", uploaded.SourceUrl);
+            uploadedMediaIds?.Add(uploaded.Id);
         }
     }
 
@@ -1292,19 +1512,13 @@ async Task<string?> GetMediaUrl(int mediaId)
 }
 
 [SuppressMessage("ReSharper", "PossibleLossOfFraction")]
-async Task<MediaItem?> UploadMedia(string sourceUrl)
+async Task<MediaItem?> UploadMedia(string sourceUrl, int? attachToPostId = null)
 {
-    // Check cache first
-    if (mediaCache.TryGetValue(sourceUrl, out var cached))
-    {
-        Console.WriteLine($"  [Cached] {Path.GetFileName(new Uri(sourceUrl).LocalPath)}");
-        return new MediaItem { Id = cached.Id, SourceUrl = cached.Url };
-    }
-
     try
     {
         var uri = new Uri(sourceUrl);
         var fileName = Path.GetFileName(uri.LocalPath);
+        var originalFileName = fileName;
         fileName = Regex.Replace(fileName, @"[^\u0000-\u007F]+", "");
         if (fileName.Length > 100)
         {
@@ -1312,9 +1526,37 @@ async Task<MediaItem?> UploadMedia(string sourceUrl)
             fileName = fileName[..(100 - ext.Length)] + ext;
         }
 
+        // Check if media already exists on target (using pre-loaded media list)
+        var targetUrl = sourceUrl.Replace(sourceWpUrl, targetWpUrl);
+
+        // Try to find by exact URL first, then by filename
+        MediaItem? existingMedia = null;
+        if (targetMediaByUrl.TryGetValue(targetUrl, out var byUrl))
+        {
+            existingMedia = byUrl;
+        }
+        else if (targetMediaByFilename.TryGetValue(originalFileName, out var byFilename))
+        {
+            existingMedia = byFilename;
+        }
+        else if (targetMediaByFilename.TryGetValue(fileName, out var bySanitizedFilename))
+        {
+            existingMedia = bySanitizedFilename;
+        }
+
+        if (existingMedia != null)
+        {
+            Console.WriteLine($"  [Exists] {fileName}");
+            if (attachToPostId.HasValue && existingMedia.Id > 0)
+            {
+                await AttachMediaToPost(existingMedia.Id, attachToPostId.Value);
+            }
+            return existingMedia;
+        }
+
         Console.Write($"  Downloading: {fileName}...");
 
-        // Download
+        // Download from source
         using var downloadResponse = await httpClient.GetAsync(sourceUrl, HttpCompletionOption.ResponseHeadersRead);
         if (!downloadResponse.IsSuccessStatusCode)
         {
@@ -1344,8 +1586,12 @@ async Task<MediaItem?> UploadMedia(string sourceUrl)
         var mediaBytes = memoryStream.ToArray();
         Console.Write($"\r  Uploading: {fileName} ({mediaBytes.Length / 1024}KB)...   ");
 
-        // Upload to target
+        // Upload to target with post attachment if specified
         var uploadUrl = $"{targetWpApiUrl}wp/v2/media";
+        if (attachToPostId.HasValue)
+        {
+            uploadUrl += $"?post={attachToPostId.Value}";
+        }
         var request = CreateAuthenticatedRequest(HttpMethod.Post, uploadUrl);
 
         using var uploadContent = new ByteArrayContent(mediaBytes);
@@ -1368,10 +1614,11 @@ async Task<MediaItem?> UploadMedia(string sourceUrl)
         var result = JsonConvert.DeserializeObject<MediaItem>(json);
         Console.WriteLine($"\r  Uploaded: {fileName} -> ID {result?.Id}                    ");
 
-        // Cache the result
-        if (result != null)
+        // Add to our lookup so we don't re-upload
+        if (result != null && !string.IsNullOrEmpty(result.SourceUrl))
         {
-            mediaCache[sourceUrl] = new MediaCacheItem { Id = result.Id, Url = result.SourceUrl };
+            targetMediaByUrl[result.SourceUrl] = result;
+            targetMediaByFilename[fileName] = result;
         }
 
         return result;
@@ -1383,11 +1630,54 @@ async Task<MediaItem?> UploadMedia(string sourceUrl)
     }
 }
 
+async Task AttachMediaToPost(int mediaId, int postId)
+{
+    try
+    {
+        var url = $"{targetWpApiUrl}wp/v2/media/{mediaId}";
+        var request = CreateAuthenticatedRequest(HttpMethod.Post, url);
+
+        var payload = new { post = postId };
+        request.Content = new StringContent(
+            JsonConvert.SerializeObject(payload),
+            Encoding.UTF8,
+            "application/json");
+
+        var response = await httpClient.SendAsync(request);
+        if (!response.IsSuccessStatusCode)
+        {
+            var error = await response.Content.ReadAsStringAsync();
+            Console.WriteLine($"  Warning: Failed to attach media {mediaId} to post {postId}: {error}");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  Warning: Error attaching media: {ex.Message}");
+    }
+}
+
+async Task<bool> VerifyMediaExists(int mediaId)
+{
+    try
+    {
+        var url = $"{targetWpApiUrl}wp/v2/media/{mediaId}?_fields=id";
+        var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
+        var response = await httpClient.SendAsync(request);
+        return response.IsSuccessStatusCode;
+    }
+    catch
+    {
+        return false;
+    }
+}
+
 static string GetBaseSlug(string slug)
 {
     // Remove WordPress duplicate suffix (-2, -3, etc.) to get the base slug
-    var match = System.Text.RegularExpressions.Regex.Match(slug, @"^(.+)-(\d+)$");
-    if (match.Success && int.TryParse(match.Groups[2].Value, out var num) && num >= 2)
+    // WordPress only appends small numbers for duplicates, typically -2 through -9
+    // We use -2 through -19 to be safe, but avoid stripping legitimate numbers like -2023, -100, etc.
+    var match = System.Text.RegularExpressions.Regex.Match(slug, @"^(.+)-([2-9]|1[0-9])$");
+    if (match.Success)
     {
         return match.Groups[1].Value;
     }
@@ -1423,6 +1713,352 @@ static string GetMimeType(string fileName)
         ".wav" => "audio/wav",
         _ => "application/octet-stream"
     };
+}
+
+// =============================================================================
+// VERIFY AND FIX EXISTING POSTS MEDIA
+// =============================================================================
+
+async Task VerifyAndFixExistingPostsMedia()
+{
+    Console.WriteLine("\n" + new string('=', 60));
+    Console.WriteLine("VERIFYING AND FIXING MEDIA FOR EXISTING POSTS");
+    Console.WriteLine(new string('=', 60));
+
+    // Build lookup for matching source posts to target posts
+    var targetPostsBySlug = targetPosts.ToDictionary(p => p.Slug, p => p);
+    var targetPostsByBaseSlug = targetPosts
+        .GroupBy(p => GetBaseSlug(p.Slug))
+        .ToDictionary(g => g.Key, g => g.First());
+
+    var postsToFix = new List<(Post sourcePost, Post targetPost)>();
+
+    foreach (var sourcePost in sourcePosts)
+    {
+        // Find matching target post (by exact slug or base slug)
+        Post? targetPost = null;
+        if (targetPostsBySlug.TryGetValue(sourcePost.Slug, out var exactMatch))
+        {
+            targetPost = exactMatch;
+        }
+        else if (targetPostsByBaseSlug.TryGetValue(sourcePost.Slug, out var baseMatch))
+        {
+            targetPost = baseMatch;
+        }
+        else if (targetPostsByBaseSlug.TryGetValue(GetBaseSlug(sourcePost.Slug), out var baseMatch2))
+        {
+            targetPost = baseMatch2;
+        }
+
+        if (targetPost != null)
+        {
+            postsToFix.Add((sourcePost, targetPost));
+        }
+    }
+
+    Console.WriteLine($"\nFound {postsToFix.Count} source-target post pairs to verify.");
+
+    var fixedFeaturedImages = 0;
+    var fixedMediaAttachments = 0;
+
+    for (var i = 0; i < postsToFix.Count; i++)
+    {
+        var (sourcePost, targetPost) = postsToFix[i];
+        var progress = ((i + 1) / (decimal)postsToFix.Count * 100).ToString("F1");
+        var hasIssues = false;
+
+        // Check 1: Featured image
+        if (sourcePost.FeaturedMedia > 0)
+        {
+            // Get current target post featured media status from API
+            var currentTargetPost = await GetTargetPostFeaturedMedia(targetPost.Id);
+
+            if (currentTargetPost == null || currentTargetPost.FeaturedMedia == null || currentTargetPost.FeaturedMedia == 0)
+            {
+                if (!hasIssues)
+                {
+                    Console.WriteLine($"\n[{progress}%] Fixing: {sourcePost.Slug}");
+                    hasIssues = true;
+                }
+
+                Console.WriteLine($"  Featured image missing, uploading...");
+                var featuredUrl = await GetMediaUrl(sourcePost.FeaturedMedia.Value);
+                if (featuredUrl != null)
+                {
+                    var uploaded = await UploadMedia(featuredUrl, targetPost.Id);
+                    if (uploaded != null)
+                    {
+                        await SetPostFeaturedImage(targetPost.Id, uploaded.Id);
+                        Console.WriteLine($"  Set featured image ID: {uploaded.Id}");
+                        fixedFeaturedImages++;
+                    }
+                }
+            }
+        }
+
+        // Check 2: Content media - get TARGET post content and check if media URLs exist
+        // Fetch current target post content from API
+        var targetContent = await GetTargetPostContent(targetPost.Id);
+        if (string.IsNullOrEmpty(targetContent))
+        {
+            continue; // Skip if we can't get content
+        }
+
+        var targetMediaUrls = ExtractMediaUrls(targetContent);
+        var urlReplacements = new Dictionary<string, string>(); // old URL -> new URL
+
+        // Also get source media URLs for finding original files
+        var sourceMediaUrls = ExtractMediaUrls(sourcePost.Content.Rendered);
+        var sourceUrlsByFilename = sourceMediaUrls
+            .Where(u => IsSourceMedia(u))
+            .ToDictionary(
+                u => Path.GetFileName(new Uri(u).LocalPath),
+                u => u,
+                StringComparer.OrdinalIgnoreCase);
+
+        foreach (var targetMediaUrl in targetMediaUrls)
+        {
+            // Only process URLs from our target domain
+            if (!targetMediaUrl.Contains(targetWpUrl) && !targetMediaUrl.Contains("new.holographica.space"))
+                continue;
+
+            var fileName = Path.GetFileName(new Uri(targetMediaUrl).LocalPath);
+
+            // Check if this media URL exists in our pre-loaded target media list
+            var mediaExists = targetMediaByUrl.ContainsKey(targetMediaUrl) ||
+                              targetMediaByFilename.ContainsKey(fileName);
+
+            if (!mediaExists)
+            {
+                if (!hasIssues)
+                {
+                    Console.WriteLine($"\n[{progress}%] Fixing: {sourcePost.Slug}");
+                    hasIssues = true;
+                }
+
+                Console.WriteLine($"  Missing media: {fileName}");
+
+                // Find the original source URL by filename
+                if (sourceUrlsByFilename.TryGetValue(fileName, out var sourceUrl))
+                {
+                    // Upload from source and attach to post
+                    var uploaded = await UploadMedia(sourceUrl, targetPost.Id);
+                    if (uploaded != null)
+                    {
+                        fixedMediaAttachments++;
+                        // Track URL replacement - replace broken target URL with new actual URL
+                        if (!string.IsNullOrEmpty(uploaded.SourceUrl) &&
+                            !uploaded.SourceUrl.Equals(targetMediaUrl, StringComparison.OrdinalIgnoreCase))
+                        {
+                            urlReplacements[targetMediaUrl] = uploaded.SourceUrl;
+                        }
+                    }
+                }
+                else
+                {
+                    Console.WriteLine($"    Could not find source file for: {fileName}");
+                }
+            }
+            else
+            {
+                // Media exists, ensure it's attached to this post
+                if (targetMediaByUrl.TryGetValue(targetMediaUrl, out var media) ||
+                    targetMediaByFilename.TryGetValue(fileName, out media))
+                {
+                    if (media.Id > 0)
+                    {
+                        await AttachMediaToPost(media.Id, targetPost.Id);
+                    }
+                }
+            }
+        }
+
+        // Update post content if we have URL replacements
+        if (urlReplacements.Count > 0)
+        {
+            Console.WriteLine($"  Updating {urlReplacements.Count} URL(s) in post content...");
+            await UpdatePostContentUrls(targetPost.Id, urlReplacements);
+        }
+    }
+
+    Console.WriteLine($"\n" + new string('-', 60));
+    Console.WriteLine($"Media verification complete:");
+    Console.WriteLine($"  Fixed featured images: {fixedFeaturedImages}");
+    Console.WriteLine($"  Fixed media attachments: {fixedMediaAttachments}");
+    Console.WriteLine(new string('-', 60));
+}
+
+List<string> ExtractMediaUrls(string content)
+{
+    var urls = new List<string>();
+    var doc = new HtmlDocument();
+    doc.LoadHtml(content);
+
+    // Extract image URLs
+    foreach (var img in doc.DocumentNode.SelectNodes("//img[@src]") ?? Enumerable.Empty<HtmlNode>())
+    {
+        var src = img.GetAttributeValue("src", "");
+        if (!string.IsNullOrEmpty(src))
+            urls.Add(src);
+    }
+
+    // Extract video URLs
+    foreach (var source in doc.DocumentNode.SelectNodes("//video//source[@src] | //video[@src]") ?? Enumerable.Empty<HtmlNode>())
+    {
+        var src = source.GetAttributeValue("src", "");
+        if (!string.IsNullOrEmpty(src))
+            urls.Add(src);
+    }
+
+    // Extract document links
+    foreach (var anchor in doc.DocumentNode.SelectNodes("//a[@href]") ?? Enumerable.Empty<HtmlNode>())
+    {
+        var href = anchor.GetAttributeValue("href", "");
+        if (string.IsNullOrEmpty(href)) continue;
+
+        var ext = Path.GetExtension(href).ToLower().Split('?')[0];
+        if (ext is ".pdf" or ".doc" or ".docx" or ".xls" or ".xlsx" or ".ppt" or ".pptx" or ".zip" or ".rar")
+        {
+            urls.Add(href);
+        }
+    }
+
+    return urls.Distinct().ToList();
+}
+
+async Task<PostFeaturedMediaInfo?> GetTargetPostFeaturedMedia(int postId)
+{
+    try
+    {
+        var url = $"{targetWpApiUrl}wp/v2/posts/{postId}?_fields=id,featured_media";
+        var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
+        var response = await httpClient.SendAsync(request);
+
+        if (!response.IsSuccessStatusCode) return null;
+
+        var json = await response.Content.ReadAsStringAsync();
+        return JsonConvert.DeserializeObject<PostFeaturedMediaInfo>(json);
+    }
+    catch
+    {
+        return null;
+    }
+}
+
+async Task<string?> GetTargetPostContent(int postId)
+{
+    try
+    {
+        var url = $"{targetWpApiUrl}wp/v2/posts/{postId}?_fields=content";
+        var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
+        var response = await httpClient.SendAsync(request);
+
+        if (!response.IsSuccessStatusCode) return null;
+
+        var json = await response.Content.ReadAsStringAsync();
+        var postData = JObject.Parse(json);
+        return postData["content"]?["rendered"]?.ToString();
+    }
+    catch
+    {
+        return null;
+    }
+}
+
+async Task SetPostFeaturedImage(int postId, int mediaId)
+{
+    try
+    {
+        var url = $"{targetWpApiUrl}wp/v2/posts/{postId}";
+        var request = CreateAuthenticatedRequest(HttpMethod.Post, url);
+
+        var payload = new { featured_media = mediaId };
+        request.Content = new StringContent(
+            JsonConvert.SerializeObject(payload),
+            Encoding.UTF8,
+            "application/json");
+
+        var response = await httpClient.SendAsync(request);
+        if (!response.IsSuccessStatusCode)
+        {
+            var error = await response.Content.ReadAsStringAsync();
+            Console.WriteLine($"  Warning: Failed to set featured image: {error}");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  Warning: Error setting featured image: {ex.Message}");
+    }
+}
+
+async Task UpdatePostContentUrls(int postId, Dictionary<string, string> urlReplacements)
+{
+    try
+    {
+        // First, get the current post content
+        var getUrl = $"{targetWpApiUrl}wp/v2/posts/{postId}?_fields=content";
+        var getRequest = CreateAuthenticatedRequest(HttpMethod.Get, getUrl);
+        var getResponse = await httpClient.SendAsync(getRequest);
+
+        if (!getResponse.IsSuccessStatusCode)
+        {
+            Console.WriteLine($"  Warning: Failed to get post content for URL update");
+            return;
+        }
+
+        var json = await getResponse.Content.ReadAsStringAsync();
+        var postData = JObject.Parse(json);
+        var content = postData["content"]?["rendered"]?.ToString();
+
+        if (string.IsNullOrEmpty(content))
+        {
+            Console.WriteLine($"  Warning: Post content is empty");
+            return;
+        }
+
+        // Replace all old URLs with new URLs
+        var updatedContent = content;
+        foreach (var (oldUrl, newUrl) in urlReplacements)
+        {
+            updatedContent = updatedContent.Replace(oldUrl, newUrl);
+            // Also try without protocol to catch mixed http/https
+            var oldPath = oldUrl.Replace("https://", "").Replace("http://", "");
+            var newPath = newUrl.Replace("https://", "").Replace("http://", "");
+            updatedContent = updatedContent.Replace(oldPath, newPath);
+        }
+
+        // Only update if content actually changed
+        if (updatedContent == content)
+        {
+            Console.WriteLine($"  No URL changes needed in content");
+            return;
+        }
+
+        // Update the post with new content
+        var updateUrl = $"{targetWpApiUrl}wp/v2/posts/{postId}";
+        var updateRequest = CreateAuthenticatedRequest(HttpMethod.Post, updateUrl);
+
+        var payload = new { content = updatedContent };
+        updateRequest.Content = new StringContent(
+            JsonConvert.SerializeObject(payload),
+            Encoding.UTF8,
+            "application/json");
+
+        var updateResponse = await httpClient.SendAsync(updateRequest);
+        if (!updateResponse.IsSuccessStatusCode)
+        {
+            var error = await updateResponse.Content.ReadAsStringAsync();
+            Console.WriteLine($"  Warning: Failed to update post content: {error}");
+        }
+        else
+        {
+            Console.WriteLine($"  Post content updated with new URLs");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  Warning: Error updating post content: {ex.Message}");
+    }
 }
 
 // =============================================================================
@@ -1506,40 +2142,6 @@ string CleanupHtml(string content)
 }
 
 // =============================================================================
-// REDIRECTS
-// =============================================================================
-
-async Task GenerateRedirects()
-{
-    Console.WriteLine("\nGenerating redirects...");
-
-    var redirects = new List<object>();
-
-    foreach (var post in sourcePosts)
-    {
-        var categoryId = post.Categories.FirstOrDefault();
-        var categorySlug = "uncategorized";
-
-        if (categoryId > 0 && sourceCategoriesDict.TryGetValue(categoryId, out var cat))
-        {
-            categorySlug = cat.Slug;
-        }
-
-        redirects.Add(new
-        {
-            from = $"/{categorySlug}/{post.Slug}/",
-            to = $"/{post.Slug}/",
-            permanent = true
-        });
-    }
-
-    var json = JsonConvert.SerializeObject(redirects, Formatting.Indented);
-    var redirectsFile = Path.Combine(dataFolder, "redirects.json");
-    await File.WriteAllTextAsync(redirectsFile, json);
-
-    Console.WriteLine($"Generated {redirects.Count} redirects to {redirectsFile}");
-}
-
 // =============================================================================
 // MODELS
 // =============================================================================
@@ -1556,16 +2158,16 @@ class PostSlugInfo
     [JsonProperty("date")] public DateTime Date { get; set; }
 }
 
+class PostFeaturedMediaInfo
+{
+    [JsonProperty("id")] public int Id { get; set; }
+    [JsonProperty("featured_media")] public int? FeaturedMedia { get; set; }
+}
+
 public class MediaItem
 {
     [JsonProperty("id")] public int Id { get; set; }
     [JsonProperty("source_url")] public string SourceUrl { get; set; } = "";
-}
-
-public class MediaCacheItem
-{
-    public int Id { get; init; }
-    public string Url { get; init; } = "";
 }
 
 // =============================================================================
