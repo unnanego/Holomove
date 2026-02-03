@@ -8,7 +8,13 @@
       "WebFetch(domain:forum.ghost.org)",
       "WebFetch(domain:ghost.org)",
       "WebFetch(domain:docs.ghost.org)",
-      "Bash(dotnet build:*)"
+      "Bash(dotnet build:*)",
+      "Bash(dotnet --list-sdks:*)",
+      "Bash(where:*)",
+      "Bash(\"C:\\\\Program Files\\\\dotnet\\\\dotnet.exe\" --list-sdks)",
+      "Bash(\"C:\\\\Program Files\\\\dotnet\\\\dotnet.exe\" --info)",
+      "Bash(dir /s /b \"C:\\\\Program Files\\\\dotnet\\\\sdk\")",
+      "Bash(powershell -Command:*)"
     ],
     "deny": [],
     "ask": []

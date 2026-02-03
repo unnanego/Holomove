@@ -72,15 +72,15 @@ await AuthenticateTargetWp();
 await LoadCache();
 await DownloadTargetMediaList();
 await DownloadAllPostsAndCompare();
+FindAndPrintDuplicates();
 await DeleteDuplicatePosts();
 await MigrateAuthors();
 await UpdateExistingPostsAuthors();
 await ProcessPosts();
-await VerifyAndFixExistingPostsMedia(); // Fix featured images and media attachments
+await VerifyAndFixExistingPostsMedia();
 await SaveCache();
 
 Console.WriteLine("\nMigration complete!");
-return;
 
 // =============================================================================
 // AUTHENTICATION
@@ -472,51 +472,6 @@ async Task DownloadAllPostsAndCompare()
     }
 
     // ==========================================================================
-    // DUPLICATE DETECTION: Find posts with same slug
-    // ==========================================================================
-    Console.WriteLine("\n" + new string('-', 60));
-    Console.WriteLine("DUPLICATE DETECTION");
-    Console.WriteLine(new string('-', 60));
-
-    // Find duplicate slugs in source
-    var sourceSlugGroups = sourcePosts
-        .GroupBy(p => GetBaseSlug(p.Slug))
-        .Where(g => g.Count() > 1)
-        .ToList();
-
-    if (sourceSlugGroups.Count > 0)
-    {
-        Console.WriteLine($"\nSource duplicates (same base slug): {sourceSlugGroups.Count} groups");
-        foreach (var group in sourceSlugGroups)
-        {
-            Console.WriteLine($"  '{group.Key}': {string.Join(", ", group.Select(p => $"ID {p.Id} ({p.Slug})"))}");
-        }
-    }
-    else
-    {
-        Console.WriteLine("\nNo duplicate slugs in source.");
-    }
-
-    // Find duplicate slugs in target
-    var targetSlugGroups = targetPosts
-        .GroupBy(p => GetBaseSlug(p.Slug))
-        .Where(g => g.Count() > 1)
-        .ToList();
-
-    if (targetSlugGroups.Count > 0)
-    {
-        Console.WriteLine($"\nTarget duplicates (same base slug): {targetSlugGroups.Count} groups");
-        foreach (var group in targetSlugGroups)
-        {
-            Console.WriteLine($"  '{group.Key}': {string.Join(", ", group.Select(p => $"ID {p.Id} ({p.Slug})"))}");
-        }
-    }
-    else
-    {
-        Console.WriteLine("\nNo duplicate slugs in target.");
-    }
-
-    // ==========================================================================
     // MIGRATION STATUS: Find posts missing from target
     // ==========================================================================
     Console.WriteLine("\n" + new string('-', 60));
@@ -566,17 +521,7 @@ async Task DownloadAllPostsAndCompare()
         TotalSourcePosts = sourcePosts.Count,
         TotalTargetPosts = targetPosts.Count,
         AlreadyMigrated = alreadyMigratedPosts.Select(p => new { p.Id, p.Slug, p.Date }).ToList(),
-        NeedMigration = postsNeedingMigration.Select(p => new { p.Id, p.Slug, p.Date }).ToList(),
-        SourceDuplicates = sourceSlugGroups.Select(g => new
-        {
-            BaseSlug = g.Key,
-            Posts = g.Select(p => new { p.Id, p.Slug, p.Date }).ToList()
-        }).ToList(),
-        TargetDuplicates = targetSlugGroups.Select(g => new
-        {
-            BaseSlug = g.Key,
-            Posts = g.Select(p => new { p.Id, p.Slug, p.Date }).ToList()
-        }).ToList()
+        NeedMigration = postsNeedingMigration.Select(p => new { p.Id, p.Slug, p.Date }).ToList()
     };
     await SaveToCache("migrationStatus.json", migrationStatus);
     Console.WriteLine($"\nMigration status saved to: migrationStatus.json");
@@ -706,6 +651,57 @@ void BuildLookupDictionaries()
 // =============================================================================
 // DUPLICATE DETECTION AND CLEANUP
 // =============================================================================
+
+void FindAndPrintDuplicates()
+{
+    Console.WriteLine("\n" + new string('=', 60));
+    Console.WriteLine("FINDING DUPLICATES ON TARGET");
+    Console.WriteLine(new string('=', 60));
+
+    Console.WriteLine($"\nSource posts: {sourcePosts.Count}");
+    Console.WriteLine($"Target posts in cache: {targetPosts.Count}");
+
+    // Build lookup of target posts by slug (using cache)
+    var targetPostsBySlug = targetPosts.ToDictionary(p => p.Slug, p => p);
+
+    // Find duplicates: target posts where slug is {source_slug}-2, -3, etc. AND has EXACT same date+time
+    var duplicates = new List<(Post source, Post duplicate)>();
+
+    foreach (var sourcePost in sourcePosts)
+    {
+        // Check for -2, -3, ... -19 suffixes
+        for (int suffix = 2; suffix <= 19; suffix++)
+        {
+            var potentialDuplicateSlug = $"{sourcePost.Slug}-{suffix}";
+
+            if (targetPostsBySlug.TryGetValue(potentialDuplicateSlug, out var targetPost))
+            {
+                // Duplicates have IDENTICAL timestamps (same date AND time)
+                if (targetPost.Date == sourcePost.Date)
+                {
+                    duplicates.Add((sourcePost, targetPost));
+                }
+            }
+        }
+    }
+
+    if (duplicates.Count == 0)
+    {
+        Console.WriteLine("\nNo duplicates found.");
+    }
+    else
+    {
+        Console.WriteLine($"\nFound {duplicates.Count} duplicate(s):");
+        Console.WriteLine(new string('-', 60));
+
+        foreach (var (source, dup) in duplicates.OrderBy(d => d.source.Slug))
+        {
+            Console.WriteLine($"  Source: {source.Slug} (ID: {source.Id}, Date: {source.Date:yyyy-MM-dd HH:mm:ss})");
+            Console.WriteLine($"  Duplicate: {dup.Slug} (ID: {dup.Id}, Date: {dup.Date:yyyy-MM-dd HH:mm:ss})");
+            Console.WriteLine();
+        }
+    }
+}
 
 async Task DeleteDuplicatePosts()
 {
@@ -838,7 +834,7 @@ async Task<List<PostSlugInfo>> FetchAllTargetPostsWithSlugs()
     {
         try
         {
-            var url = $"{targetWpApiUrl}wp/v2/posts?_fields=id,slug&per_page=100&page={page}";
+            var url = $"{targetWpApiUrl}wp/v2/posts?_fields=id,slug,date&per_page=100&page={page}";
             var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
             var response = await httpClient.SendAsync(request);
             var json = await response.Content.ReadAsStringAsync();
