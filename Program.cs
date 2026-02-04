@@ -74,11 +74,11 @@ await DownloadTargetMediaList();
 await DownloadAllPostsAndCompare();
 var duplicates = FindDuplicates();
 await DeleteDuplicatePosts(duplicates);
-// await MigrateAuthors();
-// await UpdateExistingPostsAuthors();
-// await ProcessPosts();
-// await VerifyAndFixExistingPostsMedia();
-// await SaveCache();
+await MigrateAuthors();
+await UpdateExistingPostsAuthors();
+await ProcessPosts();
+await VerifyAndFixExistingPostsMedia();
+await SaveCache();
 
 Console.WriteLine("\nMigration complete!");
 
