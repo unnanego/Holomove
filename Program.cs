@@ -72,13 +72,13 @@ await AuthenticateTargetWp();
 await LoadCache();
 await DownloadTargetMediaList();
 await DownloadAllPostsAndCompare();
-FindAndPrintDuplicates();
-await DeleteDuplicatePosts();
-await MigrateAuthors();
-await UpdateExistingPostsAuthors();
-await ProcessPosts();
-await VerifyAndFixExistingPostsMedia();
-await SaveCache();
+var duplicates = FindDuplicates();
+await DeleteDuplicatePosts(duplicates);
+// await MigrateAuthors();
+// await UpdateExistingPostsAuthors();
+// await ProcessPosts();
+// await VerifyAndFixExistingPostsMedia();
+// await SaveCache();
 
 Console.WriteLine("\nMigration complete!");
 
@@ -652,7 +652,7 @@ void BuildLookupDictionaries()
 // DUPLICATE DETECTION AND CLEANUP
 // =============================================================================
 
-void FindAndPrintDuplicates()
+List<Post> FindDuplicates()
 {
     Console.WriteLine("\n" + new string('=', 60));
     Console.WriteLine("FINDING DUPLICATES ON TARGET");
@@ -665,7 +665,7 @@ void FindAndPrintDuplicates()
     var targetPostsBySlug = targetPosts.ToDictionary(p => p.Slug, p => p);
 
     // Find duplicates: target posts where slug is {source_slug}-2, -3, etc. AND has EXACT same date+time
-    var duplicates = new List<(Post source, Post duplicate)>();
+    var duplicates = new List<Post>();
 
     foreach (var sourcePost in sourcePosts)
     {
@@ -679,7 +679,8 @@ void FindAndPrintDuplicates()
                 // Duplicates have IDENTICAL timestamps (same date AND time)
                 if (targetPost.Date == sourcePost.Date)
                 {
-                    duplicates.Add((sourcePost, targetPost));
+                    duplicates.Add(targetPost);
+                    Console.WriteLine($"  {sourcePost.Slug} -> {targetPost.Slug} (Date: {sourcePost.Date:yyyy-MM-dd HH:mm:ss})");
                 }
             }
         }
@@ -691,125 +692,32 @@ void FindAndPrintDuplicates()
     }
     else
     {
-        Console.WriteLine($"\nFound {duplicates.Count} duplicate(s):");
-        Console.WriteLine(new string('-', 60));
-
-        foreach (var (source, dup) in duplicates.OrderBy(d => d.source.Slug))
-        {
-            Console.WriteLine($"  Source: {source.Slug} (ID: {source.Id}, Date: {source.Date:yyyy-MM-dd HH:mm:ss})");
-            Console.WriteLine($"  Duplicate: {dup.Slug} (ID: {dup.Id}, Date: {dup.Date:yyyy-MM-dd HH:mm:ss})");
-            Console.WriteLine();
-        }
+        Console.WriteLine($"\nFound {duplicates.Count} duplicate(s) to delete.");
     }
+
+    return duplicates;
 }
 
-async Task DeleteDuplicatePosts()
+async Task DeleteDuplicatePosts(List<Post> duplicates)
 {
-    Console.WriteLine("\nChecking for duplicate posts on target...");
-
-    // Fetch all posts from target API with slug info
-    var allTargetPosts = await FetchAllTargetPostsWithSlugs();
-
-    if (allTargetPosts.Count == 0)
+    if (duplicates.Count == 0)
     {
-        Console.WriteLine("No posts found on target.");
+        Console.WriteLine("\nNo duplicates to delete.");
         return;
     }
 
-    // Find WordPress duplicates: posts with -2, -3, etc. suffix where a base post exists
-    // WordPress appends -2, -3, etc. when creating posts with duplicate slugs
-    var slugSet = allTargetPosts.Select(p => p.Slug).ToHashSet();
-    var postsToDelete = new List<(int Id, string Slug)>();
+    Console.WriteLine($"\nDeleting {duplicates.Count} duplicate post(s)...");
 
-    // Group posts by their base slug to find families
-    var postsByBaseSlug = allTargetPosts
-        .GroupBy(p => GetBaseSlug(p.Slug))
-        .Where(g => g.Count() > 1) // Only groups with potential duplicates
-        .ToList();
-
-    if (postsByBaseSlug.Count == 0)
-    {
-        Console.WriteLine("No duplicate posts found.");
-        return;
-    }
-
-    Console.WriteLine($"Found {postsByBaseSlug.Count} slug group(s) to check for duplicates:");
-
-    foreach (var group in postsByBaseSlug)
-    {
-        var baseSlug = group.Key;
-        var posts = group.ToList();
-
-        // Check if there's a base post (without suffix)
-        var basePost = posts.FirstOrDefault(p => p.Slug == baseSlug);
-
-        // Find posts that are clearly duplicates (have -N suffix where base exists or same date)
-        var duplicateSuffixPosts = posts
-            .Where(p => p.Slug != baseSlug && GetBaseSlug(p.Slug) == baseSlug)
-            .ToList();
-
-        if (duplicateSuffixPosts.Count == 0) continue;
-
-        // If we have a base post, duplicates are the suffix ones
-        // If no base post, check if suffix posts have the same date (meaning they're duplicates of each other)
-        List<PostSlugInfo> duplicates;
-        PostSlugInfo keepPost;
-
-        if (basePost != null)
-        {
-            // Keep the base post, delete suffix posts with same date
-            keepPost = basePost;
-            duplicates = duplicateSuffixPosts
-                .Where(p => p.Date.Date == basePost.Date.Date)
-                .ToList();
-        }
-        else
-        {
-            // No base post - group suffix posts by date and keep oldest ID per date
-            var sameDate = duplicateSuffixPosts
-                .GroupBy(p => p.Date.Date)
-                .Where(g => g.Count() > 1)
-                .ToList();
-
-            if (sameDate.Count == 0) continue;
-
-            foreach (var dateGroup in sameDate)
-            {
-                var sorted = dateGroup.OrderBy(p => p.Id).ToList();
-                keepPost = sorted.First();
-                duplicates = sorted.Skip(1).ToList();
-
-                if (duplicates.Count > 0)
-                {
-                    Console.WriteLine($"  '{baseSlug}' ({dateGroup.Key:yyyy-MM-dd}): keeping ID {keepPost.Id} ({keepPost.Slug}), deleting {string.Join(", ", duplicates.Select(p => $"{p.Id} ({p.Slug})"))}");
-                    postsToDelete.AddRange(duplicates.Select(d => (d.Id, d.Slug)));
-                }
-            }
-            continue;
-        }
-
-        if (duplicates.Count > 0)
-        {
-            Console.WriteLine($"  '{baseSlug}' ({keepPost.Date.Date:yyyy-MM-dd}): keeping ID {keepPost.Id} ({keepPost.Slug}), deleting {string.Join(", ", duplicates.Select(p => $"{p.Id} ({p.Slug})"))}");
-            postsToDelete.AddRange(duplicates.Select(d => (d.Id, d.Slug)));
-        }
-    }
-
-    if (postsToDelete.Count == 0) return;
-
-    Console.WriteLine($"\nDeleting {postsToDelete.Count} duplicate post(s)...");
-
-    foreach (var (id, slug) in postsToDelete)
+    foreach (var post in duplicates)
     {
         try
         {
-            Console.Write($"  Deleting post {id} ({slug})...");
-            var success = await DeletePost(id);
+            Console.Write($"  Deleting post {post.Id} ({post.Slug})...");
+            var success = await DeletePost(post.Id);
             if (success)
             {
                 Console.WriteLine(" Done");
-                // Remove from local cache
-                targetPosts.RemoveAll(p => p.Id == id);
+                targetPosts.RemoveAll(p => p.Id == post.Id);
             }
             else
             {
