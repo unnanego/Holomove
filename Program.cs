@@ -1672,29 +1672,67 @@ async Task VerifyAndFixExistingPostsMedia()
         var hasIssues = false;
 
         // Check 1: Featured image
-        if (sourcePost.FeaturedMedia > 0)
         {
             // Get current target post featured media status from API
             var currentTargetPost = await GetTargetPostFeaturedMedia(targetPost.Id);
 
-            if (currentTargetPost == null || currentTargetPost.FeaturedMedia == null || currentTargetPost.FeaturedMedia == 0)
-            {
-                if (!hasIssues)
-                {
-                    Console.WriteLine($"\n[{progress}%] Fixing: {sourcePost.Slug}");
-                    hasIssues = true;
-                }
+            var featuredMediaMissing = currentTargetPost == null
+                || currentTargetPost.FeaturedMedia == null
+                || currentTargetPost.FeaturedMedia == 0
+                || !await VerifyMediaExists(currentTargetPost.FeaturedMedia.Value);
 
-                Console.WriteLine($"  Featured image missing, uploading...");
-                var featuredUrl = await GetMediaUrl(sourcePost.FeaturedMedia.Value);
-                if (featuredUrl != null)
+            if (featuredMediaMissing)
+            {
+                if (sourcePost.FeaturedMedia > 0)
                 {
-                    var uploaded = await UploadMedia(featuredUrl, targetPost.Id);
-                    if (uploaded != null)
+                    // Source had an explicit featured image - upload it
+                    if (!hasIssues)
                     {
-                        await SetPostFeaturedImage(targetPost.Id, uploaded.Id);
-                        Console.WriteLine($"  Set featured image ID: {uploaded.Id}");
-                        fixedFeaturedImages++;
+                        Console.WriteLine($"\n[{progress}%] Fixing: {sourcePost.Slug}");
+                        hasIssues = true;
+                    }
+
+                    Console.WriteLine($"  Featured image missing, uploading...");
+                    var featuredUrl = await GetMediaUrl(sourcePost.FeaturedMedia.Value);
+                    if (featuredUrl != null)
+                    {
+                        var uploaded = await UploadMedia(featuredUrl, targetPost.Id);
+                        if (uploaded != null)
+                        {
+                            await SetPostFeaturedImage(targetPost.Id, uploaded.Id);
+                            Console.WriteLine($"  Set featured image ID: {uploaded.Id}");
+                            fixedFeaturedImages++;
+                        }
+                    }
+                }
+                else
+                {
+                    // Source had no explicit featured image - use first image from content
+                    // (skip posts that start with a video)
+                    var doc = new HtmlDocument();
+                    doc.LoadHtml(sourcePost.Content.Rendered);
+
+                    var firstMedia = doc.DocumentNode.SelectSingleNode("//img[@src] | //video");
+                    if (firstMedia != null && firstMedia.Name == "img")
+                    {
+                        var src = firstMedia.GetAttributeValue("src", "");
+                        if (!string.IsNullOrEmpty(src) && IsSourceMedia(src))
+                        {
+                            if (!hasIssues)
+                            {
+                                Console.WriteLine($"\n[{progress}%] Fixing: {sourcePost.Slug}");
+                                hasIssues = true;
+                            }
+
+                            Console.WriteLine($"  No featured image set, using first content image...");
+                            var uploaded = await UploadMedia(src, targetPost.Id);
+                            if (uploaded != null)
+                            {
+                                await SetPostFeaturedImage(targetPost.Id, uploaded.Id);
+                                Console.WriteLine($"  Set featured image ID: {uploaded.Id}");
+                                fixedFeaturedImages++;
+                            }
+                        }
                     }
                 }
             }
