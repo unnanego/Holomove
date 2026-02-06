@@ -14,7 +14,14 @@
       "Bash(\"C:\\\\Program Files\\\\dotnet\\\\dotnet.exe\" --list-sdks)",
       "Bash(\"C:\\\\Program Files\\\\dotnet\\\\dotnet.exe\" --info)",
       "Bash(dir /s /b \"C:\\\\Program Files\\\\dotnet\\\\sdk\")",
-      "Bash(powershell -Command:*)"
+      "Bash(powershell -Command:*)",
+      "WebFetch(domain:new.holographica.space)",
+      "Bash(python3:*)",
+      "Bash(git pull:*)",
+      "Bash(curl:*)",
+      "Bash(TOKEN=\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOjEsIm5hbWUiOiJ1bm5hbmVnbyIsImlhdCI6MTc3MDM2NzYxMywiZXhwIjoxOTI4MDQ3NjEzfQ.tlitp4BByUyvcChwkE3WS9p0JZq3oJmxviet1DGdDz4\")",
+      "WebFetch(domain:forum.tagdiv.com)",
+      "mcp__ide__getDiagnostics"
     ],
     "deny": [],
     "ask": []

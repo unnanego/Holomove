@@ -69,8 +69,13 @@ var targetMediaByFilename = new Dictionary<string, MediaItem>(StringComparer.Ord
 // =============================================================================
 
 await AuthenticateTargetWp();
+
 await LoadCache();
 await DownloadTargetMediaList();
+await VerifyAndFixExistingPostsMedia();
+await SaveCache();
+return;
+
 await DownloadAllPostsAndCompare();
 var duplicates = FindDuplicates();
 await DeleteDuplicatePosts(duplicates);
@@ -1223,6 +1228,27 @@ async Task MigratePost(Post sourcePost)
                 featuredMediaId = uploaded.Id;
             }
         }
+        else
+        {
+            // Source media URL not resolvable - fall back to first content image
+            Console.WriteLine($"  Source featured media not found, falling back to first content image...");
+            var doc = new HtmlDocument();
+            doc.LoadHtml(sourcePost.Content.Rendered);
+
+            var firstMedia = doc.DocumentNode.SelectSingleNode("//img[@src] | //video");
+            if (firstMedia != null && firstMedia.Name == "img")
+            {
+                var src = firstMedia.GetAttributeValue("src", "");
+                if (!string.IsNullOrEmpty(src) && IsSourceMedia(src))
+                {
+                    var uploaded = await UploadMedia(src);
+                    if (uploaded != null)
+                    {
+                        featuredMediaId = uploaded.Id;
+                    }
+                }
+            }
+        }
     }
 
     // 6. Get custom fields (meta) from source post - only post_views
@@ -1606,6 +1632,68 @@ static string GetMimeType(string fileName)
 }
 
 // =============================================================================
+// DIAGNOSTIC: FIND POSTS WITH MISSING FEATURED IMAGES
+// =============================================================================
+
+async Task FindPostsWithMissingFeaturedImages()
+{
+    Console.WriteLine("\n" + new string('=', 60));
+    Console.WriteLine("CHECKING FOR MISSING FEATURED IMAGES");
+    Console.WriteLine(new string('=', 60));
+
+    var targetPostsBySlug = targetPosts.ToDictionary(p => p.Slug, p => p);
+
+    var postsToCheck = new List<(Post sourcePost, Post targetPost)>();
+    foreach (var sourcePost in sourcePosts)
+    {
+        if (targetPostsBySlug.TryGetValue(sourcePost.Slug, out var targetPost))
+        {
+            postsToCheck.Add((sourcePost, targetPost));
+        }
+    }
+
+    Console.WriteLine($"Matched {postsToCheck.Count} source-target pairs.");
+
+    // Fetch featured_media for all target posts
+    var targetPostIds = postsToCheck.Select(p => p.targetPost.Id).ToList();
+    var targetPostData = await BatchFetchTargetPostData(targetPostIds);
+    Console.WriteLine($"Fetched data for {targetPostData.Count} target posts.");
+
+    // Check which featured media IDs actually exist
+    var featuredMediaIds = targetPostData.Values
+        .Where(d => d.featuredMedia is > 0)
+        .Select(d => d.featuredMedia!.Value)
+        .Distinct()
+        .ToList();
+    var existingMediaIds = await BatchVerifyMediaExist(featuredMediaIds);
+
+    var missing = new List<(string slug, int targetId, int? targetFeaturedMedia, int? sourceFeaturedMedia)>();
+
+    foreach (var (sourcePost, targetPost) in postsToCheck)
+    {
+        if (!targetPostData.TryGetValue(targetPost.Id, out var postData))
+        {
+            missing.Add((sourcePost.Slug, targetPost.Id, null, sourcePost.FeaturedMedia));
+            continue;
+        }
+
+        var featuredMediaMissing = postData.featuredMedia is null or 0
+            || !existingMediaIds.Contains(postData.featuredMedia.Value);
+
+        if (featuredMediaMissing)
+        {
+            missing.Add((sourcePost.Slug, targetPost.Id, postData.featuredMedia, sourcePost.FeaturedMedia));
+        }
+    }
+
+    Console.WriteLine($"\n{missing.Count} posts with missing featured images:\n");
+    foreach (var (slug, targetId, targetFM, sourceFM) in missing.OrderBy(m => m.slug))
+    {
+        Console.WriteLine($"  {slug}  (target ID: {targetId}, target featured_media: {targetFM ?? 0}, source featured_media: {sourceFM ?? 0})");
+    }
+}
+
+// =============================================================================
 // VERIFY AND FIX EXISTING POSTS MEDIA
 // =============================================================================
 
@@ -1705,36 +1793,19 @@ async Task VerifyAndFixExistingPostsMedia()
                             fixedFeaturedImages++;
                         }
                     }
+                    else
+                    {
+                        // Source media URL not resolvable - fall back to first content image or video
+                        if (!hasIssues) { Console.WriteLine($"\n[{progress}%] Fixing: {sourcePost.Slug}"); hasIssues = true; }
+                        Console.WriteLine($"  Source media not found, falling back to content...");
+                        if (await TrySetFeaturedFromContent(sourcePost, targetPost)) fixedFeaturedImages++;
+                    }
                 }
                 else
                 {
-                    // Source had no explicit featured image - use first image from content
-                    // (skip posts that start with a video)
-                    var doc = new HtmlDocument();
-                    doc.LoadHtml(sourcePost.Content.Rendered);
-
-                    var firstMedia = doc.DocumentNode.SelectSingleNode("//img[@src] | //video");
-                    if (firstMedia != null && firstMedia.Name == "img")
-                    {
-                        var src = firstMedia.GetAttributeValue("src", "");
-                        if (!string.IsNullOrEmpty(src) && IsSourceMedia(src))
-                        {
-                            if (!hasIssues)
-                            {
-                                Console.WriteLine($"\n[{progress}%] Fixing: {sourcePost.Slug}");
-                                hasIssues = true;
-                            }
-
-                            Console.WriteLine($"  No featured image set, using first content image...");
-                            var uploaded = await UploadMedia(src, targetPost.Id);
-                            if (uploaded != null)
-                            {
-                                await SetPostFeaturedImage(targetPost.Id, uploaded.Id);
-                                Console.WriteLine($"  Set featured image ID: {uploaded.Id}");
-                                fixedFeaturedImages++;
-                            }
-                        }
-                    }
+                    // Source had no explicit featured image - use first image or video from content
+                    if (!hasIssues) { Console.WriteLine($"\n[{progress}%] Fixing: {sourcePost.Slug}"); hasIssues = true; }
+                    if (await TrySetFeaturedFromContent(sourcePost, targetPost)) fixedFeaturedImages++;
                 }
             }
         }
@@ -1934,6 +2005,103 @@ async Task<HashSet<int>> BatchVerifyMediaExist(List<int> mediaIds)
     }
 
     return existing;
+}
+
+async Task<bool> TrySetFeaturedFromContent(Post sourcePost, Post targetPost)
+{
+    var doc = new HtmlDocument();
+    doc.LoadHtml(sourcePost.Content.Rendered);
+
+    // Try first image from content
+    var firstImg = doc.DocumentNode.SelectSingleNode("//img[@src]");
+    if (firstImg != null)
+    {
+        var src = firstImg.GetAttributeValue("src", "");
+        if (!string.IsNullOrEmpty(src) && IsSourceMedia(src))
+        {
+            Console.WriteLine($"  Using first content image...");
+            var uploaded = await UploadMedia(src, targetPost.Id);
+            if (uploaded != null)
+            {
+                await SetPostFeaturedImage(targetPost.Id, uploaded.Id);
+                Console.WriteLine($"  Set featured image ID: {uploaded.Id}");
+                return true;
+            }
+        }
+    }
+
+    // No image found - try to extract video URL from iframe (YouTube/Vimeo)
+    var iframe = doc.DocumentNode.SelectSingleNode("//iframe[@src]");
+    if (iframe != null)
+    {
+        var iframeSrc = iframe.GetAttributeValue("src", "");
+        var videoUrl = ExtractVideoUrl(iframeSrc);
+        if (videoUrl != null)
+        {
+            Console.WriteLine($"  No image, setting featured video: {videoUrl}");
+            await SetPostFeaturedVideo(targetPost.Id, videoUrl);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+string? ExtractVideoUrl(string iframeSrc)
+{
+    // YouTube embed URL -> watch URL
+    var ytMatch = Regex.Match(iframeSrc, @"youtube\.com/embed/([a-zA-Z0-9_-]+)");
+    if (ytMatch.Success)
+        return $"https://www.youtube.com/watch?v={ytMatch.Groups[1].Value}";
+
+    // Vimeo embed URL -> vimeo URL
+    var vimeoMatch = Regex.Match(iframeSrc, @"player\.vimeo\.com/video/(\d+)");
+    if (vimeoMatch.Success)
+        return $"https://vimeo.com/{vimeoMatch.Groups[1].Value}";
+
+    // Dailymotion embed URL
+    var dmMatch = Regex.Match(iframeSrc, @"dailymotion\.com/embed/video/([a-zA-Z0-9]+)");
+    if (dmMatch.Success)
+        return $"https://www.dailymotion.com/video/{dmMatch.Groups[1].Value}";
+
+    return null;
+}
+
+async Task SetPostFeaturedVideo(int postId, string videoUrl)
+{
+    try
+    {
+        var url = $"{targetWpApiUrl}wp/v2/posts/{postId}";
+        var request = CreateAuthenticatedRequest(HttpMethod.Post, url);
+
+        // tagDiv theme stores video as PHP-serialized array: a:1:{s:8:"td_video";s:LENGTH:"URL";}
+        var serialized = $"a:1:{{s:8:\"td_video\";s:{videoUrl.Length}:\"{videoUrl}\";}}";
+
+        // Don't set format to "video" — it causes 504 on the target site's theme
+        var payload = new
+        {
+            meta = new Dictionary<string, object>
+            {
+                ["td_post_video"] = new[] { serialized },
+                ["td_post_video_duration"] = new[] { "" }
+            }
+        };
+        request.Content = new StringContent(
+            JsonConvert.SerializeObject(payload),
+            Encoding.UTF8,
+            "application/json");
+
+        var response = await httpClient.SendAsync(request);
+        if (!response.IsSuccessStatusCode)
+        {
+            var error = await response.Content.ReadAsStringAsync();
+            Console.WriteLine($"  Warning: Failed to set featured video: {error}");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  Warning: Error setting featured video: {ex.Message}");
+    }
 }
 
 async Task SetPostFeaturedImage(int postId, int mediaId)
