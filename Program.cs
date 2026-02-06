@@ -1560,20 +1560,6 @@ async Task AttachMediaToPost(int mediaId, int postId)
     }
 }
 
-async Task<bool> VerifyMediaExists(int mediaId)
-{
-    try
-    {
-        var url = $"{targetWpApiUrl}wp/v2/media/{mediaId}?_fields=id";
-        var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
-        var response = await httpClient.SendAsync(request);
-        return response.IsSuccessStatusCode;
-    }
-    catch
-    {
-        return false;
-    }
-}
 
 static string GetBaseSlug(string slug)
 {
@@ -1662,6 +1648,22 @@ async Task VerifyAndFixExistingPostsMedia()
 
     Console.WriteLine($"\nFound {postsToFix.Count} source-target post pairs to verify.");
 
+    // Batch fetch all target post data (featured_media + content) in one go
+    Console.WriteLine("Fetching target post data in bulk...");
+    var targetPostIds = postsToFix.Select(p => p.targetPost.Id).ToList();
+    var targetPostData = await BatchFetchTargetPostData(targetPostIds);
+    Console.WriteLine($"  Fetched data for {targetPostData.Count} posts.");
+
+    // Batch verify which featured media IDs actually exist
+    var featuredMediaIds = targetPostData.Values
+        .Where(d => d.featuredMedia is > 0)
+        .Select(d => d.featuredMedia!.Value)
+        .Distinct()
+        .ToList();
+    Console.WriteLine($"Verifying {featuredMediaIds.Count} featured media items...");
+    var existingMediaIds = await BatchVerifyMediaExist(featuredMediaIds);
+    Console.WriteLine($"  {existingMediaIds.Count} exist, {featuredMediaIds.Count - existingMediaIds.Count} missing.");
+
     var fixedFeaturedImages = 0;
     var fixedMediaAttachments = 0;
 
@@ -1671,15 +1673,14 @@ async Task VerifyAndFixExistingPostsMedia()
         var progress = ((i + 1) / (decimal)postsToFix.Count * 100).ToString("F1");
         var hasIssues = false;
 
+        // Get pre-fetched data for this target post
+        if (!targetPostData.TryGetValue(targetPost.Id, out var postData))
+            continue;
+
         // Check 1: Featured image
         {
-            // Get current target post featured media status from API
-            var currentTargetPost = await GetTargetPostFeaturedMedia(targetPost.Id);
-
-            var featuredMediaMissing = currentTargetPost == null
-                || currentTargetPost.FeaturedMedia == null
-                || currentTargetPost.FeaturedMedia == 0
-                || !await VerifyMediaExists(currentTargetPost.FeaturedMedia.Value);
+            var featuredMediaMissing = postData.featuredMedia is null or 0
+                || !existingMediaIds.Contains(postData.featuredMedia.Value);
 
             if (featuredMediaMissing)
             {
@@ -1738,9 +1739,8 @@ async Task VerifyAndFixExistingPostsMedia()
             }
         }
 
-        // Check 2: Content media - get TARGET post content and check if media URLs exist
-        // Fetch current target post content from API
-        var targetContent = await GetTargetPostContent(targetPost.Id);
+        // Check 2: Content media - check if media URLs in target content exist
+        var targetContent = postData.content;
         if (string.IsNullOrEmpty(targetContent))
         {
             continue; // Skip if we can't get content
@@ -1801,18 +1801,6 @@ async Task VerifyAndFixExistingPostsMedia()
                     Console.WriteLine($"    Could not find source file for: {fileName}");
                 }
             }
-            else
-            {
-                // Media exists, ensure it's attached to this post
-                if (targetMediaByUrl.TryGetValue(targetMediaUrl, out var media) ||
-                    targetMediaByFilename.TryGetValue(fileName, out media))
-                {
-                    if (media.Id > 0)
-                    {
-                        await AttachMediaToPost(media.Id, targetPost.Id);
-                    }
-                }
-            }
         }
 
         // Update post content if we have URL replacements
@@ -1868,43 +1856,84 @@ List<string> ExtractMediaUrls(string content)
     return urls.Distinct().ToList();
 }
 
-async Task<PostFeaturedMediaInfo?> GetTargetPostFeaturedMedia(int postId)
+async Task<Dictionary<int, (int? featuredMedia, string? content)>> BatchFetchTargetPostData(List<int> postIds)
 {
-    try
-    {
-        var url = $"{targetWpApiUrl}wp/v2/posts/{postId}?_fields=id,featured_media";
-        var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
-        var response = await httpClient.SendAsync(request);
+    var result = new Dictionary<int, (int? featuredMedia, string? content)>();
 
-        if (!response.IsSuccessStatusCode) return null;
-
-        var json = await response.Content.ReadAsStringAsync();
-        return JsonConvert.DeserializeObject<PostFeaturedMediaInfo>(json);
-    }
-    catch
+    // WP REST API supports up to 100 IDs per request
+    foreach (var batch in postIds.Chunk(100))
     {
-        return null;
+        try
+        {
+            var ids = string.Join(",", batch);
+            var url = $"{targetWpApiUrl}wp/v2/posts?include={ids}&_fields=id,featured_media,content&per_page={batch.Length}";
+            var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
+            var response = await httpClient.SendAsync(request);
+
+            if (!response.IsSuccessStatusCode) continue;
+
+            var json = await response.Content.ReadAsStringAsync();
+            var posts = JArray.Parse(json);
+            foreach (var post in posts)
+            {
+                var id = post["id"]!.Value<int>();
+                var featuredMedia = post["featured_media"]?.Value<int?>();
+                var content = post["content"]?["rendered"]?.ToString();
+                result[id] = (featuredMedia, content);
+            }
+        }
+        catch
+        {
+            // Fall back to individual fetches for this batch
+            foreach (var id in batch)
+            {
+                try
+                {
+                    var url = $"{targetWpApiUrl}wp/v2/posts/{id}?_fields=id,featured_media,content";
+                    var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
+                    var response = await httpClient.SendAsync(request);
+                    if (!response.IsSuccessStatusCode) continue;
+
+                    var json = await response.Content.ReadAsStringAsync();
+                    var post = JObject.Parse(json);
+                    var featuredMedia = post["featured_media"]?.Value<int?>();
+                    var content = post["content"]?["rendered"]?.ToString();
+                    result[id] = (featuredMedia, content);
+                }
+                catch { /* skip */ }
+            }
+        }
     }
+
+    return result;
 }
 
-async Task<string?> GetTargetPostContent(int postId)
+async Task<HashSet<int>> BatchVerifyMediaExist(List<int> mediaIds)
 {
-    try
-    {
-        var url = $"{targetWpApiUrl}wp/v2/posts/{postId}?_fields=content";
-        var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
-        var response = await httpClient.SendAsync(request);
+    var existing = new HashSet<int>();
 
-        if (!response.IsSuccessStatusCode) return null;
-
-        var json = await response.Content.ReadAsStringAsync();
-        var postData = JObject.Parse(json);
-        return postData["content"]?["rendered"]?.ToString();
-    }
-    catch
+    foreach (var batch in mediaIds.Distinct().Chunk(100))
     {
-        return null;
+        try
+        {
+            var ids = string.Join(",", batch);
+            var url = $"{targetWpApiUrl}wp/v2/media?include={ids}&_fields=id&per_page={batch.Length}";
+            var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
+            var response = await httpClient.SendAsync(request);
+
+            if (!response.IsSuccessStatusCode) continue;
+
+            var json = await response.Content.ReadAsStringAsync();
+            var items = JArray.Parse(json);
+            foreach (var item in items)
+            {
+                existing.Add(item["id"]!.Value<int>());
+            }
+        }
+        catch { /* skip batch */ }
     }
+
+    return existing;
 }
 
 async Task SetPostFeaturedImage(int postId, int mediaId)
