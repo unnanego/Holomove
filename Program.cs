@@ -1792,6 +1792,7 @@ async Task VerifyAndFixExistingPostsMedia()
                             Console.WriteLine($"  Set featured image ID: {uploaded.Id}");
                             fixedFeaturedImages++;
                         }
+                        await Task.Delay(1000); // Throttle to avoid overwhelming server
                     }
                     else
                     {
@@ -1799,6 +1800,7 @@ async Task VerifyAndFixExistingPostsMedia()
                         if (!hasIssues) { Console.WriteLine($"\n[{progress}%] Fixing: {sourcePost.Slug}"); hasIssues = true; }
                         Console.WriteLine($"  Source media not found, falling back to content...");
                         if (await TrySetFeaturedFromContent(sourcePost, targetPost)) fixedFeaturedImages++;
+                        await Task.Delay(1000); // Throttle to avoid overwhelming server
                     }
                 }
                 else
@@ -1806,6 +1808,7 @@ async Task VerifyAndFixExistingPostsMedia()
                     // Source had no explicit featured image - use first image or video from content
                     if (!hasIssues) { Console.WriteLine($"\n[{progress}%] Fixing: {sourcePost.Slug}"); hasIssues = true; }
                     if (await TrySetFeaturedFromContent(sourcePost, targetPost)) fixedFeaturedImages++;
+                    await Task.Delay(1000); // Throttle to avoid overwhelming server
                 }
             }
         }
@@ -1866,6 +1869,7 @@ async Task VerifyAndFixExistingPostsMedia()
                             urlReplacements[targetMediaUrl] = uploaded.SourceUrl;
                         }
                     }
+                    await Task.Delay(1000); // Throttle to avoid overwhelming server
                 }
                 else
                 {
