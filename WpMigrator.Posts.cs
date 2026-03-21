@@ -19,7 +19,7 @@ public partial class WpMigrator
         Console.WriteLine($"  Source: {_sourceAuthors.Count} authors, {_sourceTags.Count} tags, {_sourceCategories.Count} categories");
 
         // Fetch all post IDs
-        var allIds = await GetAllPostIds(Config.SourceWpApiUrl, useAuth: false);
+        var allIds = await GetAllPostIds(_config.SourceWpApiUrl, useAuth: false);
         Console.WriteLine($"  Source: {allIds.Count} posts on API");
 
         // Only download posts we don't already have
@@ -71,7 +71,7 @@ public partial class WpMigrator
         {
             try
             {
-                var url = $"{Config.TargetWpApiUrl}wp/v2/posts?per_page=100&page={page}";
+                var url = $"{_config.TargetWpApiUrl}wp/v2/posts?per_page=100&page={page}";
                 var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
                 var response = await _httpClient.SendAsync(request);
 
@@ -306,7 +306,7 @@ public partial class WpMigrator
         if (updates.Count == 0) return false;
 
         // Send single update
-        var response = await PostJsonAsync($"{Config.TargetWpApiUrl}wp/v2/posts/{targetPost.Id}", updates);
+        var response = await PostJsonAsync($"{_config.TargetWpApiUrl}wp/v2/posts/{targetPost.Id}", updates);
         return response.IsSuccessStatusCode;
     }
 
@@ -356,7 +356,7 @@ public partial class WpMigrator
             progress.Update(i + 1, duplicates.Count, post.Slug);
             try
             {
-                var url = $"{Config.TargetWpApiUrl}wp/v2/posts/{post.Id}?force=true";
+                var url = $"{_config.TargetWpApiUrl}wp/v2/posts/{post.Id}?force=true";
                 var request = CreateAuthenticatedRequest(HttpMethod.Delete, url);
                 var response = await _httpClient.SendAsync(request);
                 if (response.IsSuccessStatusCode) _targetPosts.RemoveAll(p => p.Id == post.Id);
@@ -408,7 +408,7 @@ public partial class WpMigrator
     {
         try
         {
-            var url = $"{Config.SourceWpApiUrl}wp/v2/posts/{postId}?_fields=meta";
+            var url = $"{_config.SourceWpApiUrl}wp/v2/posts/{postId}?_fields=meta";
             var response = await _httpClient.GetAsync(url);
             if (!response.IsSuccessStatusCode) return null;
 
@@ -423,7 +423,7 @@ public partial class WpMigrator
     {
         try
         {
-            await PostJsonAsync($"{Config.TargetWpApiUrl}wp/v2/posts/{postId}", new { meta });
+            await PostJsonAsync($"{_config.TargetWpApiUrl}wp/v2/posts/{postId}", new { meta });
         }
         catch { /* best effort */ }
     }

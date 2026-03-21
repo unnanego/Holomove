@@ -6,7 +6,15 @@ Console.WriteLine("  ║       Holomove - WP Migration        ║");
 Console.WriteLine("  ╚══════════════════════════════════════╝");
 Console.WriteLine();
 
-var migrator = new WpMigrator();
+var config = SiteConfig.Load();
+
+if (!config.IsConfigured)
+{
+    Console.WriteLine("  No configuration found. Running setup...");
+    config = SiteConfig.RunSetup();
+}
+
+var migrator = new WpMigrator(config);
 await migrator.Init();
 
 while (true)
@@ -22,6 +30,10 @@ while (true)
     Console.Write("    status   ");
     Console.ResetColor();
     Console.WriteLine("Compare source vs target, show progress");
+    Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.Write("    setup    ");
+    Console.ResetColor();
+    Console.WriteLine("Configure source/target WordPress sites");
     Console.ForegroundColor = ConsoleColor.Cyan;
     Console.Write("    exit     ");
     Console.ResetColor();
@@ -48,6 +60,11 @@ while (true)
                 break;
             case "status":
                 await migrator.Status();
+                break;
+            case "setup":
+                config = SiteConfig.RunSetup();
+                migrator = new WpMigrator(config);
+                await migrator.Init();
                 break;
             default:
                 Console.ForegroundColor = ConsoleColor.Red;

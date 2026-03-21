@@ -10,9 +10,9 @@ public partial class WpMigrator
     {
         Console.WriteLine("  Authenticating with target WordPress...");
 
-        var tokenRequest = new HttpRequestMessage(HttpMethod.Post, $"{Config.TargetWpApiUrl}api/v1/token");
+        var tokenRequest = new HttpRequestMessage(HttpMethod.Post, $"{_config.TargetWpApiUrl}api/v1/token");
         tokenRequest.Content = new StringContent(
-            JsonConvert.SerializeObject(new { username = Config.TargetWpUsername, password = Config.TargetWpPassword }),
+            JsonConvert.SerializeObject(new { username = _config.TargetUsername, password = _config.TargetPassword }),
             Encoding.UTF8,
             "application/json");
 

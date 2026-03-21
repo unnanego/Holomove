@@ -39,7 +39,8 @@
       "Read(//tmp/**)",
       "Bash(grep -n \"\\\\.Where\\(.*\\\\=\\\\>\" *.cs)",
       "Bash(\"/c/Program Files/dotnet/dotnet\" run)",
-      "Bash(\"/c/Program Files/dotnet/dotnet\" build -warnaserror)"
+      "Bash(\"/c/Program Files/dotnet/dotnet\" build -warnaserror)",
+      "Bash(printf 'holographica.space\\\\nnew.holographica.space\\\\nunnanego\\\\ncezmx6#DBjJrjL#rOy\\\\nbackup\\\\nexit\\\\n')"
     ],
     "deny": [],
     "ask": []

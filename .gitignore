@@ -5,6 +5,9 @@ obj/
 # Local backup
 backup/
 
+# Settings (contains credentials)
+settings.json
+
 # Visual Studio files
 .vs/
 *.user

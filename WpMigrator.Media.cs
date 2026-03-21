@@ -19,7 +19,7 @@ public partial class WpMigrator
         {
             try
             {
-                var url = $"{Config.TargetWpApiUrl}wp/v2/media?per_page=100&page={page}&_fields=id,source_url";
+                var url = $"{_config.TargetWpApiUrl}wp/v2/media?per_page=100&page={page}&_fields=id,source_url";
                 var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
                 var response = await _httpClient.SendAsync(request);
 
@@ -83,16 +83,16 @@ public partial class WpMigrator
         return uploadedIds;
     }
 
-    private static bool IsSourceMedia(string url)
+    private bool IsSourceMedia(string url)
     {
-        return url.Contains(Config.SourceWpUrl) || url.Contains($"{Config.SourceDomain}/wp-content/uploads");
+        return url.Contains(_config.SourceWpUrl) || url.Contains($"{_config.SourceDomain}/wp-content/uploads");
     }
 
     private async Task<string?> GetMediaUrl(int mediaId)
     {
         try
         {
-            var url = $"{Config.SourceWpApiUrl}wp/v2/media/{mediaId}?_fields=source_url";
+            var url = $"{_config.SourceWpApiUrl}wp/v2/media/{mediaId}?_fields=source_url";
             var response = await _httpClient.GetAsync(url);
             if (!response.IsSuccessStatusCode) return null;
 
@@ -121,7 +121,7 @@ public partial class WpMigrator
                 fileName = fileName[..(100 - ext.Length)] + ext;
             }
 
-            var targetUrl = sourceUrl.Replace(Config.SourceWpUrl, Config.TargetWpUrl);
+            var targetUrl = sourceUrl.Replace(_config.SourceWpUrl, _config.TargetWpUrl);
 
             MediaItem? existingMedia = null;
             if (_targetMediaByUrl.TryGetValue(targetUrl, out var byUrl))
@@ -147,7 +147,7 @@ public partial class WpMigrator
 
             var mediaBytes = memoryStream.ToArray();
 
-            var uploadUrl = $"{Config.TargetWpApiUrl}wp/v2/media";
+            var uploadUrl = $"{_config.TargetWpApiUrl}wp/v2/media";
             if (attachToPostId.HasValue)
                 uploadUrl += $"?post={attachToPostId.Value}";
 
@@ -184,7 +184,7 @@ public partial class WpMigrator
     {
         try
         {
-            await PostJsonAsync($"{Config.TargetWpApiUrl}wp/v2/media/{mediaId}", new { post = postId });
+            await PostJsonAsync($"{_config.TargetWpApiUrl}wp/v2/media/{mediaId}", new { post = postId });
         }
         catch { /* best effort */ }
     }

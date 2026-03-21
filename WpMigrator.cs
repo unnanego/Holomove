@@ -8,6 +8,7 @@ namespace Holomove;
 
 public partial class WpMigrator
 {
+    private readonly SiteConfig _config;
     private readonly WordPressClient _sourceWp;
     private readonly WordPressClient _targetWp;
     private readonly HttpClient _httpClient;
@@ -34,10 +35,11 @@ public partial class WpMigrator
     private readonly Dictionary<string, MediaItem> _targetMediaByUrl = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, MediaItem> _targetMediaByFilename = new(StringComparer.OrdinalIgnoreCase);
 
-    public WpMigrator()
+    public WpMigrator(SiteConfig config)
     {
-        _sourceWp = new WordPressClient(Config.SourceWpApiUrl);
-        _targetWp = new WordPressClient(Config.TargetWpApiUrl);
+        _config = config;
+        _sourceWp = new WordPressClient(config.SourceWpApiUrl);
+        _targetWp = new WordPressClient(config.TargetWpApiUrl);
 
         var retryHandler = new RetryHandler(new HttpClientHandler()) { MaxRetries = 3 };
         _httpClient = new HttpClient(retryHandler) { Timeout = TimeSpan.FromMinutes(30) };
@@ -77,9 +79,9 @@ public partial class WpMigrator
 
         // 4. Sync to target
         await SyncAuthors();
-        BuildLookupDictionaries(); // Rebuild after new authors created
+        BuildLookupDictionaries();
         await SyncTaxonomy();
-        BuildLookupDictionaries(); // Rebuild after new tags/categories created
+        BuildLookupDictionaries();
         await SyncAllPosts();
 
         // 5. Cleanup
@@ -116,7 +118,7 @@ public partial class WpMigrator
     {
         try
         {
-            var request = CreateAuthenticatedRequest(HttpMethod.Get, $"{Config.TargetWpApiUrl}wp/v2/{endpoint}?per_page=100");
+            var request = CreateAuthenticatedRequest(HttpMethod.Get, $"{_config.TargetWpApiUrl}wp/v2/{endpoint}?per_page=100");
             var response = await _httpClient.SendAsync(request);
             var json = await response.Content.ReadAsStringAsync();
 
@@ -170,5 +172,4 @@ public partial class WpMigrator
             _ => "application/octet-stream"
         };
     }
-
 }

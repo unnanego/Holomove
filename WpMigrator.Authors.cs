@@ -45,12 +45,12 @@ public partial class WpMigrator
         {
             var randomPassword = System.Guid.NewGuid().ToString("N")[..16];
 
-            var response = await PostJsonAsync($"{Config.TargetWpApiUrl}wp/v2/users", new
+            var response = await PostJsonAsync($"{_config.TargetWpApiUrl}wp/v2/users", new
             {
                 username = sourceAuthor.Slug,
                 name = sourceAuthor.Name,
                 slug = sourceAuthor.Slug,
-                email = $"{sourceAuthor.Slug}@{Config.SourceDomain}",
+                email = $"{sourceAuthor.Slug}@{_config.SourceDomain}",
                 password = randomPassword,
                 roles = StringArray,
                 description = sourceAuthor.Description ?? ""

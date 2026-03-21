@@ -7,11 +7,11 @@ namespace Holomove;
 
 public partial class WpMigrator
 {
-    private string _backupRoot = Config.BackupPath;
+    private string _backupRoot = "";
 
     private void InitBackup()
     {
-        _backupRoot = Path.GetFullPath(Config.BackupPath);
+        _backupRoot = Path.GetFullPath(_config.BackupPath);
         Directory.CreateDirectory(_backupRoot);
         Directory.CreateDirectory(Path.Combine(_backupRoot, "posts"));
         Directory.CreateDirectory(Path.Combine(_backupRoot, "authors"));
@@ -153,7 +153,7 @@ public partial class WpMigrator
     {
         var metadata = new BackupMetadata
         {
-            SiteUrl = Config.SourceWpUrl,
+            SiteUrl = _config.SourceWpUrl,
             ExportDate = DateTime.Now,
             PostCount = _sourcePosts.Count,
             AuthorCount = _sourceAuthors.Count,
