@@ -8,7 +8,7 @@ public partial class WpMigrator
 {
     private async Task Authenticate()
     {
-        Console.WriteLine("Authenticating with target WordPress...");
+        Console.WriteLine("  Authenticating with target WordPress...");
 
         var tokenRequest = new HttpRequestMessage(HttpMethod.Post, $"{Config.TargetWpApiUrl}api/v1/token");
         tokenRequest.Content = new StringContent(
@@ -21,12 +21,9 @@ public partial class WpMigrator
 
         if (!response.IsSuccessStatusCode)
         {
-            Console.WriteLine($"JWT authentication failed: {json}");
-            Console.WriteLine("Make sure JWT Authentication plugin is installed and configured.");
+            Console.WriteLine($"  Authentication failed: {response.StatusCode}");
             Environment.Exit(1);
         }
-
-        Console.WriteLine($"Response: {json}");
 
         var result = JObject.Parse(json);
         _jwtToken = result["token"]?.ToString()
@@ -36,7 +33,7 @@ public partial class WpMigrator
 
         if (string.IsNullOrEmpty(_jwtToken))
         {
-            Console.WriteLine("Failed to get JWT token from response");
+            Console.WriteLine("  Failed to get JWT token from response");
             Environment.Exit(1);
         }
 
@@ -46,6 +43,6 @@ public partial class WpMigrator
                        ?? result["name"]?.ToString()
                        ?? result["user"]?.ToString()
                        ?? "unknown";
-        Console.WriteLine($"Authenticated as: {displayName}");
+        Console.WriteLine($"  Authenticated as: {displayName}");
     }
 }

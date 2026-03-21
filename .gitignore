@@ -2,6 +2,9 @@
 bin/
 obj/
 
+# Local backup
+backup/
+
 # Visual Studio files
 .vs/
 *.user

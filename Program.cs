@@ -15,31 +15,15 @@ while (true)
     Console.ForegroundColor = ConsoleColor.DarkGray;
     Console.WriteLine("  Commands:");
     Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    migrate        ");
+    Console.Write("    migrate  ");
     Console.ResetColor();
-    Console.WriteLine("Sync and migrate posts from source to target");
+    Console.WriteLine("Sync source → backup → target (idempotent)");
     Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    status         ");
+    Console.Write("    status   ");
     Console.ResetColor();
-    Console.WriteLine("Compare source vs target, show migration progress");
+    Console.WriteLine("Compare source vs target, show progress");
     Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    fix-duplicates ");
-    Console.ResetColor();
-    Console.WriteLine("Find and delete duplicate posts on target");
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    fix-authors    ");
-    Console.ResetColor();
-    Console.WriteLine("Fix author mismatches on existing posts");
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    fix-media      ");
-    Console.ResetColor();
-    Console.WriteLine("Re-upload missing media, fix broken URLs");
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    fix-all        ");
-    Console.ResetColor();
-    Console.WriteLine("Run all fixes");
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    exit           ");
+    Console.Write("    exit     ");
     Console.ResetColor();
     Console.WriteLine("Exit the application");
     Console.WriteLine();
@@ -64,18 +48,6 @@ while (true)
                 break;
             case "status":
                 await migrator.Status();
-                break;
-            case "fix-duplicates":
-                await migrator.FixDuplicates();
-                break;
-            case "fix-authors":
-                await migrator.FixAuthors();
-                break;
-            case "fix-media":
-                await migrator.FixMedia();
-                break;
-            case "fix-all":
-                await migrator.FixAll();
                 break;
             default:
                 Console.ForegroundColor = ConsoleColor.Red;

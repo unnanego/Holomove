@@ -1,6 +1,5 @@
 using System.Net.Http.Headers;
 using System.Text;
-using System.Text.RegularExpressions;
 using Newtonsoft.Json;
 using WordPressPCL;
 using WordPressPCL.Models;
@@ -9,18 +8,17 @@ namespace Holomove;
 
 public partial class WpMigrator
 {
-    private readonly string _dataFolder;
     private readonly WordPressClient _sourceWp;
     private readonly WordPressClient _targetWp;
     private readonly HttpClient _httpClient;
     private string? _jwtToken;
 
     // Data collections
-    private List<Post> _sourcePosts = [];
+    private readonly List<Post> _sourcePosts = [];
     private List<Tag> _sourceTags = [];
     private List<User> _sourceAuthors = [];
     private List<Category> _sourceCategories = [];
-    private List<Post> _targetPosts = [];
+    private readonly List<Post> _targetPosts = [];
     private List<Tag> _targetTags = [];
     private List<User> _targetAuthors = [];
     private List<Category> _targetCategories = [];
@@ -30,7 +28,6 @@ public partial class WpMigrator
     private Dictionary<int, User> _sourceUsersDict = new();
     private Dictionary<int, Category> _sourceCategoriesDict = new();
     private Dictionary<string, Tag> _targetTagsDict = new();
-    private Dictionary<string, User> _targetAuthorsDict = new();
     private Dictionary<string, Category> _targetCategoriesDict = new();
 
     // Target media lookup
@@ -39,9 +36,6 @@ public partial class WpMigrator
 
     public WpMigrator()
     {
-        _dataFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "downloads");
-        Directory.CreateDirectory(_dataFolder);
-
         _sourceWp = new WordPressClient(Config.SourceWpApiUrl);
         _targetWp = new WordPressClient(Config.TargetWpApiUrl);
 
@@ -52,66 +46,62 @@ public partial class WpMigrator
     public async Task Init()
     {
         await Authenticate();
-        await LoadCache();
+        InitBackup();
     }
 
     public async Task Migrate()
     {
+        // 1. Fetch source data
+        await FetchSourceData();
+        BuildLookupDictionaries();
+
+        // 2. Save to local backup
+        Console.WriteLine("\n  Saving to local backup...");
+        var backupProgress = new ProgressBar();
+        for (var i = 0; i < _sourcePosts.Count; i++)
+        {
+            var post = _sourcePosts[i];
+            backupProgress.Update(i + 1, _sourcePosts.Count, post.Slug);
+            if (!PostExistsInBackup(post))
+                await SavePostToBackup(post);
+        }
+        backupProgress.Complete($"Backed up {_sourcePosts.Count} post(s).");
+        await SaveAuthorsToBackup();
+        await SaveTaxonomyToBackup();
+        await SaveMetadataToBackup();
+
+        // 3. Fetch target data
+        await FetchTargetData();
         await DownloadTargetMediaList();
-        await DownloadAllPostsAndCompare();
-        await MigrateAuthors();
-        await ProcessPosts();
-        await SaveCache();
-        Console.WriteLine("\nMigration complete!");
+        BuildLookupDictionaries();
+
+        // 4. Sync to target
+        await SyncAuthors();
+        BuildLookupDictionaries(); // Rebuild after new authors created
+        await SyncTaxonomy();
+        BuildLookupDictionaries(); // Rebuild after new tags/categories created
+        await SyncAllPosts();
+
+        // 5. Cleanup
+        await FindAndDeleteDuplicates();
+
+        Console.WriteLine("\n  Migration complete!");
     }
 
     public async Task Status()
     {
-        await DownloadAllPostsAndCompare();
-    }
-
-    public async Task FixDuplicates()
-    {
-        await DownloadAllPostsAndCompare();
-        await FindAndDeleteDuplicates();
-        await SaveCache();
-    }
-
-    public async Task FixAuthors()
-    {
-        await DownloadAllPostsAndCompare();
-        await MigrateAuthors();
-        await UpdateExistingPostsAuthors();
-        await SaveCache();
-    }
-
-    public async Task FixMedia()
-    {
-        await DownloadTargetMediaList();
-        await DownloadAllPostsAndCompare();
-        await VerifyAndFixExistingPostsMedia();
-        await SaveCache();
-    }
-
-    public async Task FixAll()
-    {
-        await DownloadTargetMediaList();
-        await DownloadAllPostsAndCompare();
-        await FindAndDeleteDuplicates();
-        await MigrateAuthors();
-        await UpdateExistingPostsAuthors();
-        await VerifyAndFixExistingPostsMedia();
-        await SaveCache();
-        Console.WriteLine("\nAll fixes complete!");
+        await FetchSourceData();
+        BuildLookupDictionaries();
+        await FetchTargetData();
+        BuildLookupDictionaries();
+        await PrintStatus();
     }
 
     private HttpRequestMessage CreateAuthenticatedRequest(HttpMethod method, string url)
     {
         var request = new HttpRequestMessage(method, url);
         if (!string.IsNullOrEmpty(_jwtToken))
-        {
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _jwtToken);
-        }
         return request;
     }
 
@@ -131,10 +121,8 @@ public partial class WpMigrator
             var json = await response.Content.ReadAsStringAsync();
 
             if (response.IsSuccessStatusCode) return JsonConvert.DeserializeObject<List<T>>(json);
-            
             Console.WriteLine($"  Error fetching {endpoint}: {json}");
             return null;
-
         }
         catch (Exception ex)
         {
@@ -149,14 +137,7 @@ public partial class WpMigrator
         _sourceUsersDict = _sourceAuthors.ToDictionary(u => u.Id);
         _sourceCategoriesDict = _sourceCategories.ToDictionary(c => c.Id);
         _targetTagsDict = _targetTags.ToDictionary(t => t.Slug);
-        _targetAuthorsDict = _targetAuthors.ToDictionary(u => u.Slug);
         _targetCategoriesDict = _targetCategories.ToDictionary(c => c.Slug);
-    }
-
-    private static string GetBaseSlug(string slug)
-    {
-        var match = DuplicateSlugSuffixRegex().Match(slug);
-        return match.Success ? match.Groups[1].Value : slug;
     }
 
     private static string GetMimeType(string fileName)
@@ -190,6 +171,4 @@ public partial class WpMigrator
         };
     }
 
-    [GeneratedRegex("^(.+)-([2-9]|1[0-9])$")]
-    private static partial Regex DuplicateSlugSuffixRegex();
 }

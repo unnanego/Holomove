@@ -38,7 +38,8 @@
       "Bash(/tmp/call_trace.txt:*)",
       "Read(//tmp/**)",
       "Bash(grep -n \"\\\\.Where\\(.*\\\\=\\\\>\" *.cs)",
-      "Bash(\"/c/Program Files/dotnet/dotnet\" run)"
+      "Bash(\"/c/Program Files/dotnet/dotnet\" run)",
+      "Bash(\"/c/Program Files/dotnet/dotnet\" build -warnaserror)"
     ],
     "deny": [],
     "ask": []
