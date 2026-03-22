@@ -148,53 +148,39 @@ public partial class WpMigrator
 
     private async Task SyncAllBackupMedia()
     {
-        var postsDir = Path.Combine(_backupRoot, "posts");
-        if (!Directory.Exists(postsDir)) return;
+        // Collect all slugs that have any media
+        var slugsWithMedia = new HashSet<string>(_backupMediaUrls.Keys);
+        foreach (var slug in _backupFeaturedMediaUrls.Keys)
+            slugsWithMedia.Add(slug);
 
-        var postFiles = Directory.GetFiles(postsDir, "post.json", SearchOption.AllDirectories);
         var downloaded = 0;
-        var removed = 0;
+        var postsBySlug = _sourcePosts.ToDictionary(p => p.Slug, p => p);
 
-        foreach (var file in postFiles)
+        foreach (var slug in slugsWithMedia)
         {
-            try
+            if (!postsBySlug.TryGetValue(slug, out var post)) continue;
+
+            var mediaFolder = Path.Combine(GetPostBackupFolder(post), "media");
+
+            var allUrls = new List<string>();
+            if (_backupMediaUrls.TryGetValue(slug, out var mediaUrls))
+                allUrls.AddRange(mediaUrls);
+            if (_backupFeaturedMediaUrls.TryGetValue(slug, out var featuredUrl))
+                allUrls.Add(featuredUrl);
+
+            foreach (var url in allUrls.Distinct())
             {
-                var json = File.ReadAllText(file);
-                var backup = JsonConvert.DeserializeObject<BackupPost>(json);
-                if (backup == null) continue;
+                var fileName = Path.GetFileName(new Uri(url).LocalPath);
+                if (File.Exists(Path.Combine(mediaFolder, fileName))) continue;
 
-                var mediaFolder = Path.Combine(Path.GetDirectoryName(file)!, "media");
-                var expectedUrls = new List<string>(backup.MediaUrls);
-                if (!string.IsNullOrEmpty(backup.FeaturedMediaUrl))
-                    expectedUrls.Add(backup.FeaturedMediaUrl);
-
-                var distinctUrls = expectedUrls.Distinct().ToList();
-
-                // Download any missing media from source
-                foreach (var url in distinctUrls)
-                {
-                    var fileName = Path.GetFileName(new Uri(url).LocalPath);
-                    if (!File.Exists(Path.Combine(mediaFolder, fileName)))
-                    {
-                        await DownloadMediaToDisk(url, mediaFolder);
-                        if (File.Exists(Path.Combine(mediaFolder, fileName)))
-                            downloaded++;
-                    }
-                }
-
-                // Remove stale files not referenced by post
-                var before = Directory.Exists(mediaFolder) ? Directory.GetFiles(mediaFolder).Length : 0;
-                CleanupBackupMedia(mediaFolder, distinctUrls);
-                var after = Directory.Exists(mediaFolder) ? Directory.GetFiles(mediaFolder).Length : 0;
-                removed += before - after;
+                await DownloadMediaToDisk(url, mediaFolder);
+                if (File.Exists(Path.Combine(mediaFolder, fileName)))
+                    downloaded++;
             }
-            catch { /* skip corrupt files */ }
         }
 
         if (downloaded > 0)
             Console.WriteLine($"  Downloaded {downloaded} missing media file(s) to backup.");
-        if (removed > 0)
-            Console.WriteLine($"  Removed {removed} stale media file(s) from backup.");
     }
 
     private async Task SaveAuthorsToBackup()
