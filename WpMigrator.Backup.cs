@@ -88,14 +88,16 @@ public partial class WpMigrator
         var json = JsonConvert.SerializeObject(backupPost, Formatting.Indented);
         await File.WriteAllTextAsync(Path.Combine(folder, "post.json"), json);
 
-        // Download media files
+        // Download media files in parallel
         var mediaFolder = Path.Combine(folder, "media");
         var allMediaUrls = new List<string>(mediaUrls);
         if (featuredUrl != null) allMediaUrls.Add(featuredUrl);
 
-        foreach (var url in allMediaUrls.Distinct())
+        var distinctUrls = allMediaUrls.Distinct().ToList();
+        if (distinctUrls.Count > 0)
         {
-            await DownloadMediaToDisk(url, mediaFolder);
+            await Parallel.ForEachAsync(distinctUrls, new ParallelOptions { MaxDegreeOfParallelism = 5 },
+                async (url, _) => await DownloadMediaToDisk(url, mediaFolder));
         }
     }
 

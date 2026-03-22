@@ -54,15 +54,24 @@ public partial class WpMigrator
 
         // 2. Save to local backup
         Console.WriteLine("\n  Saving to local backup...");
-        var backupProgress = new ProgressBar();
-        for (var i = 0; i < _sourcePosts.Count; i++)
+        var postsToBackup = _sourcePosts.Where(p => !PostExistsInBackup(p)).ToList();
+        if (postsToBackup.Count > 0)
         {
-            var post = _sourcePosts[i];
-            backupProgress.Update(i + 1, _sourcePosts.Count, post.Slug);
-            if (!PostExistsInBackup(post))
-                await SavePostToBackup(post);
+            var backupProgress = new ProgressBar();
+            var backed = 0;
+            await Parallel.ForEachAsync(postsToBackup, new ParallelOptions { MaxDegreeOfParallelism = 5 },
+                async (post, _) =>
+                {
+                    await SavePostToBackup(post);
+                    var count = Interlocked.Increment(ref backed);
+                    backupProgress.Update(count, postsToBackup.Count, post.Slug);
+                });
+            backupProgress.Complete($"Backed up {postsToBackup.Count} new post(s).");
         }
-        backupProgress.Complete($"Backed up {_sourcePosts.Count} post(s).");
+        else
+        {
+            Console.WriteLine("  All posts already backed up.");
+        }
         await SaveAuthorsToBackup();
         await SaveTaxonomyToBackup();
         await SaveMetadataToBackup();

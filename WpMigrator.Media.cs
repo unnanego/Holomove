@@ -70,17 +70,20 @@ public partial class WpMigrator
     /// </summary>
     private async Task<List<int>> UploadAllPostMedia(string content)
     {
-        var uploadedIds = new List<int>();
         var mediaUrls = ExtractMediaUrls(content).Where(IsSourceMedia).ToList();
+        if (mediaUrls.Count == 0) return [];
 
-        foreach (var url in mediaUrls)
-        {
-            var uploaded = await UploadMedia(url);
-            if (uploaded != null)
-                uploadedIds.Add(uploaded.Id);
-        }
+        var uploadedIds = new System.Collections.Concurrent.ConcurrentBag<int>();
 
-        return uploadedIds;
+        await Parallel.ForEachAsync(mediaUrls, new ParallelOptions { MaxDegreeOfParallelism = 3 },
+            async (url, _) =>
+            {
+                var uploaded = await UploadMedia(url);
+                if (uploaded != null)
+                    uploadedIds.Add(uploaded.Id);
+            });
+
+        return uploadedIds.ToList();
     }
 
     private bool IsSourceMedia(string url)
