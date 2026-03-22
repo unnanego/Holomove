@@ -31,6 +31,10 @@ public partial class WpMigrator
     private readonly Dictionary<string, MediaItem> _targetMediaByUrl = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, MediaItem> _targetMediaByFilename = new(StringComparer.OrdinalIgnoreCase);
 
+    // Backup media data (slug -> URLs) for posts loaded from backup
+    private readonly Dictionary<string, string> _backupFeaturedMediaUrls = new();
+    private readonly Dictionary<string, List<string>> _backupMediaUrls = new();
+
     public WpMigrator(SiteConfig config)
     {
         _config = config;
@@ -72,6 +76,7 @@ public partial class WpMigrator
         {
             Console.WriteLine("  All posts already backed up.");
         }
+        await SyncAllBackupMedia();
         await SaveAuthorsToBackup();
         await SaveTaxonomyToBackup();
         await SaveMetadataToBackup();
@@ -90,6 +95,7 @@ public partial class WpMigrator
 
         // 5. Cleanup
         await FindAndDeleteDuplicates();
+        SaveTargetMediaCache();
 
         Console.WriteLine("\n  Migration complete!");
     }

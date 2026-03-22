@@ -17,11 +17,13 @@ public class RetryHandler(HttpMessageHandler innerHandler) : DelegatingHandler(i
                 var clonedRequest = await CloneRequest(request);
                 response = await base.SendAsync(clonedRequest, cancellationToken);
 
-                if (response.IsSuccessStatusCode 
-                    || (int)response.StatusCode < 500 && response.StatusCode != HttpStatusCode.TooManyRequests 
+                if (response.IsSuccessStatusCode
+                    || (int)response.StatusCode < 500 && response.StatusCode != HttpStatusCode.TooManyRequests
                     || i >= MaxRetries) return response;
 
-                var delay = (i + 1) * 2000;
+                var delay = response.StatusCode is HttpStatusCode.GatewayTimeout or HttpStatusCode.ServiceUnavailable
+                    ? (i + 1) * 10000   // 10/20/30s for server overload
+                    : (i + 1) * 2000;
                 await Task.Delay(delay, cancellationToken);
             }
             catch (HttpRequestException) when (i < MaxRetries)

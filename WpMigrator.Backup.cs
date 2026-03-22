@@ -76,7 +76,7 @@ public partial class WpMigrator
             Content = post.Content.Rendered,
             Excerpt = excerpt ?? "",
             Date = post.Date,
-            Status = post.Status,
+            Status = post.Status.ToLowerInvariant(),
             AuthorName = authorName,
             TagNames = tagNames,
             CategoryNames = categoryNames,
@@ -99,6 +99,26 @@ public partial class WpMigrator
             await Parallel.ForEachAsync(distinctUrls, new ParallelOptions { MaxDegreeOfParallelism = 5 },
                 async (url, _) => await DownloadMediaToDisk(url, mediaFolder));
         }
+
+        CleanupBackupMedia(mediaFolder, distinctUrls);
+    }
+
+    private static void CleanupBackupMedia(string mediaFolder, List<string> expectedUrls)
+    {
+        if (!Directory.Exists(mediaFolder)) return;
+
+        var expectedFilenames = expectedUrls
+            .Select(url => Path.GetFileName(new Uri(url).LocalPath))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var file in Directory.GetFiles(mediaFolder))
+        {
+            if (!expectedFilenames.Contains(Path.GetFileName(file)))
+                File.Delete(file);
+        }
+
+        if (Directory.GetFiles(mediaFolder).Length == 0)
+            Directory.Delete(mediaFolder);
     }
 
     private async Task DownloadMediaToDisk(string sourceUrl, string targetFolder)
@@ -124,6 +144,57 @@ public partial class WpMigrator
         {
             // Skip failed media downloads silently for backup
         }
+    }
+
+    private async Task SyncAllBackupMedia()
+    {
+        var postsDir = Path.Combine(_backupRoot, "posts");
+        if (!Directory.Exists(postsDir)) return;
+
+        var postFiles = Directory.GetFiles(postsDir, "post.json", SearchOption.AllDirectories);
+        var downloaded = 0;
+        var removed = 0;
+
+        foreach (var file in postFiles)
+        {
+            try
+            {
+                var json = File.ReadAllText(file);
+                var backup = JsonConvert.DeserializeObject<BackupPost>(json);
+                if (backup == null) continue;
+
+                var mediaFolder = Path.Combine(Path.GetDirectoryName(file)!, "media");
+                var expectedUrls = new List<string>(backup.MediaUrls);
+                if (!string.IsNullOrEmpty(backup.FeaturedMediaUrl))
+                    expectedUrls.Add(backup.FeaturedMediaUrl);
+
+                var distinctUrls = expectedUrls.Distinct().ToList();
+
+                // Download any missing media from source
+                foreach (var url in distinctUrls)
+                {
+                    var fileName = Path.GetFileName(new Uri(url).LocalPath);
+                    if (!File.Exists(Path.Combine(mediaFolder, fileName)))
+                    {
+                        await DownloadMediaToDisk(url, mediaFolder);
+                        if (File.Exists(Path.Combine(mediaFolder, fileName)))
+                            downloaded++;
+                    }
+                }
+
+                // Remove stale files not referenced by post
+                var before = Directory.Exists(mediaFolder) ? Directory.GetFiles(mediaFolder).Length : 0;
+                CleanupBackupMedia(mediaFolder, distinctUrls);
+                var after = Directory.Exists(mediaFolder) ? Directory.GetFiles(mediaFolder).Length : 0;
+                removed += before - after;
+            }
+            catch { /* skip corrupt files */ }
+        }
+
+        if (downloaded > 0)
+            Console.WriteLine($"  Downloaded {downloaded} missing media file(s) to backup.");
+        if (removed > 0)
+            Console.WriteLine($"  Removed {removed} stale media file(s) from backup.");
     }
 
     private async Task SaveAuthorsToBackup()
@@ -168,6 +239,11 @@ public partial class WpMigrator
                 var backup = JsonConvert.DeserializeObject<BackupPost>(json);
                 if (backup == null) continue;
 
+                if (!string.IsNullOrEmpty(backup.FeaturedMediaUrl))
+                    _backupFeaturedMediaUrls[backup.Slug] = backup.FeaturedMediaUrl;
+                if (backup.MediaUrls.Count > 0)
+                    _backupMediaUrls[backup.Slug] = backup.MediaUrls;
+
                 // Only need enough to match by ID check — we use slug for sync
                 // We don't have the original WP ID in backup, so we track by slug
                 if (_sourcePosts.Any(p => p.Slug == backup.Slug)) continue;
@@ -179,7 +255,7 @@ public partial class WpMigrator
                     Title = new WpRendered { Rendered = backup.Title },
                     Content = new WpRendered { Rendered = backup.Content },
                     Excerpt = new WpRendered { Rendered = backup.Excerpt },
-                    Status = backup.Status
+                    Status = backup.Status.ToLowerInvariant()
                 });
             }
             catch { /* skip corrupt files */ }
@@ -190,7 +266,10 @@ public partial class WpMigrator
 
     private async Task SaveTargetPostCache()
     {
-        var cache = _targetPosts.Select(p => new { p.Id, p.Slug }).ToList();
+        var cache = _targetPosts.Where(p => p.Id > 0).Select(p => new
+        {
+            p.Id, p.Slug, p.Author, p.Tags, p.Categories, p.FeaturedMedia
+        }).ToList();
         await File.WriteAllTextAsync(
             Path.Combine(_backupRoot, "target-cache.json"),
             JsonConvert.SerializeObject(cache));
@@ -204,14 +283,13 @@ public partial class WpMigrator
         try
         {
             var json = File.ReadAllText(path);
-            var cache = JsonConvert.DeserializeObject<List<IdSlug>>(json) ?? [];
+            var cache = JsonConvert.DeserializeObject<List<WpPost>>(json) ?? [];
             Console.WriteLine($"  Loaded {cache.Count} target posts from cache.");
 
-            // Store as minimal Post objects for slug matching
             foreach (var item in cache)
             {
                 if (_targetPosts.Any(p => p.Id == item.Id)) continue;
-                _targetPosts.Add(new WpPost { Id = item.Id, Slug = item.Slug });
+                _targetPosts.Add(item);
             }
         }
         catch { /* ignore corrupt cache */ }

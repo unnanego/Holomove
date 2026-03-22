@@ -17,7 +17,7 @@ public partial class WpMigrator
         _sourceCategories = await FetchAllPaginated<WpCategory>(_config.SourceWpApiUrl, "categories");
         Console.WriteLine($"\r  Source: {_sourceAuthors.Count} authors, {_sourceTags.Count} tags, {_sourceCategories.Count} categories");
 
-        Console.WriteLine($"  {_sourcePosts.Count} posts in cache, fetching updates...");
+        Console.WriteLine($"  {_sourcePosts.Count} posts from backup, fetching updates...");
         await FetchPostsInBulk(_config.SourceWpApiUrl, _sourcePosts, useAuth: false);
         Console.WriteLine($"  Source: {_sourcePosts.Count} posts loaded");
     }
@@ -152,14 +152,10 @@ public partial class WpMigrator
         var authorId = ResolveTargetAuthorId(sourcePost.Author);
 
         int? featuredMediaId = null;
-        if (sourcePost.FeaturedMedia > 0)
+        if (_backupFeaturedMediaUrls.TryGetValue(sourcePost.Slug, out var featuredUrl))
         {
-            var featuredUrl = await GetMediaUrl(sourcePost.FeaturedMedia);
-            if (featuredUrl != null)
-            {
-                var uploaded = await UploadMedia(featuredUrl);
-                if (uploaded != null) featuredMediaId = uploaded.Id;
-            }
+            var uploaded = await UploadMedia(featuredUrl);
+            if (uploaded != null) featuredMediaId = uploaded.Id;
         }
 
         var excerpt = sourcePost.Excerpt.Rendered;
@@ -224,23 +220,33 @@ public partial class WpMigrator
 
         if (!targetPost.Categories.OrderBy(x => x).SequenceEqual(expectedCatIds)) updates["categories"] = expectedCatIds;
 
-        if (sourcePost.FeaturedMedia > 0 && targetPost.FeaturedMedia == 0)
+        if (targetPost.FeaturedMedia == 0 &&
+            _backupFeaturedMediaUrls.TryGetValue(sourcePost.Slug, out var featuredUrl))
         {
-            var featuredUrl = await GetMediaUrl(sourcePost.FeaturedMedia);
-            if (featuredUrl != null)
+            // Check if it already exists on target (in-memory), upload from backup only if missing
+            var existingMedia = FindMediaOnTarget(featuredUrl);
+            if (existingMedia != null)
             {
-                var uploaded = await UploadMedia(featuredUrl);
+                updates["featured_media"] = existingMedia.Id;
+            }
+            else
+            {
+                var uploaded = await UploadMedia(featuredUrl, attachToPostId: targetPost.Id);
                 if (uploaded != null)
                     updates["featured_media"] = uploaded.Id;
             }
         }
 
-        await UploadAllPostMedia(sourcePost.Content.Rendered);
+        // Check for missing inline media (in-memory lookup against target media index)
+        var missingMedia = FindMissingMedia(sourcePost.Slug);
+        if (missingMedia.Count > 0)
+            await UploadAllPostMedia(sourcePost.Content.Rendered, targetPost.Id);
 
-        if (updates.Count == 0) return false;
+        if (updates.Count == 0 && missingMedia.Count == 0) return false;
 
-        var response = await PostJsonAsync($"{_config.TargetWpApiUrl}wp/v2/posts/{targetPost.Id}", updates);
-        return response.IsSuccessStatusCode;
+        if (updates.Count > 0)
+            await PostJsonAsync($"{_config.TargetWpApiUrl}wp/v2/posts/{targetPost.Id}", updates);
+        return true;
     }
 
     private int ResolveTargetAuthorId(int sourceAuthorId)
@@ -330,6 +336,7 @@ public partial class WpMigrator
                 var posts = JsonConvert.DeserializeObject<List<WpPost>>(json) ?? [];
                 if (posts.Count == 0) break;
 
+                var newOnPage = 0;
                 foreach (var post in posts)
                 {
                     if (existingIds.Contains(post.Id)) continue;
@@ -342,9 +349,13 @@ public partial class WpMigrator
 
                     existingIds.Add(post.Id);
                     fetched++;
+                    newOnPage++;
                 }
 
                 Console.Write($"\r  Downloading posts: {fetched} new (page {page})".PadRight(width - 1));
+
+                // Stop early if entire page was already cached (posts are newest-first)
+                if (newOnPage == 0) break;
                 page++;
             }
             catch { break; }
