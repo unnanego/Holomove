@@ -2,9 +2,56 @@ using Newtonsoft.Json;
 
 namespace Holomove;
 
-public class IdOnly
+// WordPress API models
+
+public class WpPost
 {
     [JsonProperty("id")] public int Id { get; set; }
+    [JsonProperty("slug")] public string Slug { get; set; } = "";
+    [JsonProperty("date")] public DateTime Date { get; set; }
+    [JsonProperty("status")] public string Status { get; set; } = "publish";
+    [JsonProperty("title")] public WpRendered Title { get; set; } = new();
+    [JsonProperty("content")] public WpRendered Content { get; set; } = new();
+    [JsonProperty("excerpt")] public WpRendered Excerpt { get; set; } = new();
+    [JsonProperty("author")] public int Author { get; set; }
+    [JsonProperty("featured_media")] public int FeaturedMedia { get; set; }
+    [JsonProperty("tags")] public List<int> Tags { get; set; } = [];
+    [JsonProperty("categories")] public List<int> Categories { get; set; } = [];
+}
+
+public class WpRendered
+{
+    [JsonProperty("rendered")] public string Rendered { get; set; } = "";
+}
+
+public class WpTag
+{
+    [JsonProperty("id")] public int Id { get; set; }
+    [JsonProperty("slug")] public string Slug { get; set; } = "";
+    [JsonProperty("name")] public string Name { get; set; } = "";
+    [JsonProperty("description")] public string? Description { get; set; }
+}
+
+public class WpCategory
+{
+    [JsonProperty("id")] public int Id { get; set; }
+    [JsonProperty("slug")] public string Slug { get; set; } = "";
+    [JsonProperty("name")] public string Name { get; set; } = "";
+    [JsonProperty("description")] public string? Description { get; set; }
+}
+
+public class WpUser
+{
+    [JsonProperty("id")] public int Id { get; set; }
+    [JsonProperty("slug")] public string Slug { get; set; } = "";
+    [JsonProperty("name")] public string Name { get; set; } = "";
+    [JsonProperty("description")] public string? Description { get; set; }
+}
+
+public class IdSlug
+{
+    [JsonProperty("id")] public int Id { get; set; }
+    [JsonProperty("slug")] public string Slug { get; set; } = "";
 }
 
 public class MediaItem

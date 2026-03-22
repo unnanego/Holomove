@@ -1,5 +1,4 @@
 using Newtonsoft.Json;
-using WordPressPCL.Models;
 
 namespace Holomove;
 
@@ -25,53 +24,32 @@ public partial class WpMigrator
 
         foreach (var sourceAuthor in authorsToCreate)
         {
-            try
-            {
-                var newAuthor = await CreateAuthorOnTarget(sourceAuthor);
-                if (newAuthor != null)
-                {
-                    _targetAuthors.Add(newAuthor);
-                }
-            }
-            catch { /* skip */ }
-        }
-    }
+            var randomPassword = Guid.NewGuid().ToString("N")[..16];
 
-    private static readonly string[] StringArray = ["author"];
-
-    private async Task<User?> CreateAuthorOnTarget(User sourceAuthor)
-    {
-        try
-        {
-            var randomPassword = System.Guid.NewGuid().ToString("N")[..16];
-
-            var response = await PostJsonAsync($"{_config.TargetWpApiUrl}wp/v2/users", new
+            var newAuthor = await CreateOnTarget<WpUser>("users", new
             {
                 username = sourceAuthor.Slug,
                 name = sourceAuthor.Name,
                 slug = sourceAuthor.Slug,
                 email = $"{sourceAuthor.Slug}@{_config.SourceDomain}",
                 password = randomPassword,
-                roles = StringArray,
+                roles = new[] { "author" },
                 description = sourceAuthor.Description ?? ""
             });
 
-            var json = await response.Content.ReadAsStringAsync();
-
-            if (response.IsSuccessStatusCode)
-                return JsonConvert.DeserializeObject<User>(json);
-
-            if (!json.Contains("existing_user_login") && !json.Contains("existing_user_email")) return null;
-            
-            var refreshedAuthors = await FetchAllFromApi<User>("users");
-            return refreshedAuthors?.FirstOrDefault(a =>
-                a.Slug.Equals(sourceAuthor.Slug, StringComparison.OrdinalIgnoreCase) ||
-                a.Name.Equals(sourceAuthor.Name, StringComparison.OrdinalIgnoreCase));
-
-        }
-        catch
-        {
-            return null;
+            if (newAuthor != null)
+            {
+                _targetAuthors.Add(newAuthor);
+            }
+            else
+            {
+                // May already exist — refresh and find
+                var all = await FetchAllPaginated<WpUser>(_config.TargetWpApiUrl, "users", useAuth: true);
+                var existing = all.FirstOrDefault(a =>
+                    a.Slug.Equals(sourceAuthor.Slug, StringComparison.OrdinalIgnoreCase) ||
+                    a.Name.Equals(sourceAuthor.Name, StringComparison.OrdinalIgnoreCase));
+                if (existing != null) _targetAuthors.Add(existing);
+            }
         }
     }
 }

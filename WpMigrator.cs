@@ -1,35 +1,31 @@
 using System.Net.Http.Headers;
 using System.Text;
 using Newtonsoft.Json;
-using WordPressPCL;
-using WordPressPCL.Models;
 
 namespace Holomove;
 
 public partial class WpMigrator
 {
     private readonly SiteConfig _config;
-    private readonly WordPressClient _sourceWp;
-    private readonly WordPressClient _targetWp;
     private readonly HttpClient _httpClient;
     private string? _jwtToken;
 
     // Data collections
-    private readonly List<Post> _sourcePosts = [];
-    private List<Tag> _sourceTags = [];
-    private List<User> _sourceAuthors = [];
-    private List<Category> _sourceCategories = [];
-    private readonly List<Post> _targetPosts = [];
-    private List<Tag> _targetTags = [];
-    private List<User> _targetAuthors = [];
-    private List<Category> _targetCategories = [];
+    private readonly List<WpPost> _sourcePosts = [];
+    private List<WpTag> _sourceTags = [];
+    private List<WpUser> _sourceAuthors = [];
+    private List<WpCategory> _sourceCategories = [];
+    private readonly List<WpPost> _targetPosts = [];
+    private List<WpTag> _targetTags = [];
+    private List<WpUser> _targetAuthors = [];
+    private List<WpCategory> _targetCategories = [];
 
     // Lookup dictionaries
-    private Dictionary<int, Tag> _sourceTagsDict = new();
-    private Dictionary<int, User> _sourceUsersDict = new();
-    private Dictionary<int, Category> _sourceCategoriesDict = new();
-    private Dictionary<string, Tag> _targetTagsDict = new();
-    private Dictionary<string, Category> _targetCategoriesDict = new();
+    private Dictionary<int, WpTag> _sourceTagsDict = new();
+    private Dictionary<int, WpUser> _sourceUsersDict = new();
+    private Dictionary<int, WpCategory> _sourceCategoriesDict = new();
+    private Dictionary<string, WpTag> _targetTagsDict = new();
+    private Dictionary<string, WpCategory> _targetCategoriesDict = new();
 
     // Target media lookup
     private readonly Dictionary<string, MediaItem> _targetMediaByUrl = new(StringComparer.OrdinalIgnoreCase);
@@ -38,9 +34,6 @@ public partial class WpMigrator
     public WpMigrator(SiteConfig config)
     {
         _config = config;
-        _sourceWp = new WordPressClient(config.SourceWpApiUrl);
-        _targetWp = new WordPressClient(config.TargetWpApiUrl);
-
         var retryHandler = new RetryHandler(new HttpClientHandler()) { MaxRetries = 3 };
         _httpClient = new HttpClient(retryHandler) { Timeout = TimeSpan.FromMinutes(30) };
     }
@@ -49,6 +42,8 @@ public partial class WpMigrator
     {
         await Authenticate();
         InitBackup();
+        LoadSourcePostsFromBackup();
+        LoadTargetPostCache();
     }
 
     public async Task Migrate()
@@ -114,23 +109,52 @@ public partial class WpMigrator
         return await _httpClient.SendAsync(request);
     }
 
-    private async Task<List<T>?> FetchAllFromApi<T>(string endpoint)
+    private async Task<List<T>> FetchAllPaginated<T>(string apiUrl, string endpoint, bool useAuth = false)
+    {
+        var all = new List<T>();
+        var page = 1;
+
+        while (true)
+        {
+            try
+            {
+                var url = $"{apiUrl}wp/v2/{endpoint}?per_page=100&page={page}";
+
+                HttpResponseMessage response;
+                if (useAuth)
+                {
+                    var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
+                    response = await _httpClient.SendAsync(request);
+                }
+                else
+                {
+                    response = await _httpClient.GetAsync(url);
+                }
+
+                if (!response.IsSuccessStatusCode) break;
+
+                var json = await response.Content.ReadAsStringAsync();
+                var items = JsonConvert.DeserializeObject<List<T>>(json) ?? [];
+                if (items.Count == 0) break;
+
+                all.AddRange(items);
+                page++;
+            }
+            catch { break; }
+        }
+
+        return all;
+    }
+
+    private async Task<T?> CreateOnTarget<T>(string endpoint, object payload) where T : class
     {
         try
         {
-            var request = CreateAuthenticatedRequest(HttpMethod.Get, $"{_config.TargetWpApiUrl}wp/v2/{endpoint}?per_page=100");
-            var response = await _httpClient.SendAsync(request);
+            var response = await PostJsonAsync($"{_config.TargetWpApiUrl}wp/v2/{endpoint}", payload);
             var json = await response.Content.ReadAsStringAsync();
-
-            if (response.IsSuccessStatusCode) return JsonConvert.DeserializeObject<List<T>>(json);
-            Console.WriteLine($"  Error fetching {endpoint}: {json}");
-            return null;
+            return response.IsSuccessStatusCode ? JsonConvert.DeserializeObject<T>(json) : null;
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"  Error fetching {endpoint}: {ex.Message}");
-            return null;
-        }
+        catch { return null; }
     }
 
     private void BuildLookupDictionaries()

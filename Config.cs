@@ -4,12 +4,11 @@ namespace Holomove;
 
 public class SiteConfig
 {
-    public string SourceDomain { get; private set; } = "";
-    public string TargetUsername { get; private set; } = "";
-    public string TargetPassword { get; private set; } = "";
-    public string BackupPath { get; private set; } = "backup";
-    
-    private string TargetDomain { get; set; } = "";
+    public string SourceDomain { get; set; } = "";
+    public string TargetDomain { get; set; } = "";
+    public string TargetUsername { get; set; } = "";
+    public string TargetPassword { get; set; } = "";
+    public string BackupPath { get; set; } = "backup";
 
     [JsonIgnore] public string SourceWpUrl => $"https://{SourceDomain}";
     [JsonIgnore] public string SourceWpApiUrl => $"{SourceWpUrl}/wp-json/";

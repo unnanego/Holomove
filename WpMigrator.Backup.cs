@@ -1,7 +1,6 @@
 using System.Net;
 using AngleSharp.Html.Parser;
 using Newtonsoft.Json;
-using WordPressPCL.Models;
 
 namespace Holomove;
 
@@ -17,7 +16,7 @@ public partial class WpMigrator
         Directory.CreateDirectory(Path.Combine(_backupRoot, "authors"));
     }
 
-    private string GetPostBackupFolder(Post post)
+    private string GetPostBackupFolder(WpPost post)
     {
         var date = post.Date;
         return Path.Combine(_backupRoot, "posts",
@@ -27,13 +26,13 @@ public partial class WpMigrator
             post.Slug);
     }
 
-    private bool PostExistsInBackup(Post post)
+    private bool PostExistsInBackup(WpPost post)
     {
         var folder = GetPostBackupFolder(post);
         return File.Exists(Path.Combine(folder, "post.json"));
     }
 
-    private async Task SavePostToBackup(Post post)
+    private async Task SavePostToBackup(WpPost post)
     {
         var folder = GetPostBackupFolder(post);
         Directory.CreateDirectory(folder);
@@ -59,7 +58,7 @@ public partial class WpMigrator
         // Get featured media URL
         string? featuredUrl = null;
         if (post.FeaturedMedia > 0)
-            featuredUrl = await GetMediaUrl(post.FeaturedMedia.Value);
+            featuredUrl = await GetMediaUrl(post.FeaturedMedia);
 
         // Prepare excerpt
         var excerpt = post.Excerpt.Rendered;
@@ -77,7 +76,7 @@ public partial class WpMigrator
             Content = post.Content.Rendered,
             Excerpt = excerpt ?? "",
             Date = post.Date,
-            Status = post.Status.ToString(),
+            Status = post.Status,
             AuthorName = authorName,
             TagNames = tagNames,
             CategoryNames = categoryNames,
@@ -147,6 +146,73 @@ public partial class WpMigrator
 
         var categories = _sourceCategories.Select(c => new { c.Name, c.Slug, c.Description }).ToList();
         await File.WriteAllTextAsync(Path.Combine(_backupRoot, "categories.json"), JsonConvert.SerializeObject(categories, Formatting.Indented));
+    }
+
+    private void LoadSourcePostsFromBackup()
+    {
+        var postsDir = Path.Combine(_backupRoot, "posts");
+        if (!Directory.Exists(postsDir)) return;
+
+        var postFiles = Directory.GetFiles(postsDir, "post.json", SearchOption.AllDirectories);
+        if (postFiles.Length == 0) return;
+
+        Console.Write($"  Loading {postFiles.Length} posts from backup...");
+
+        foreach (var file in postFiles)
+        {
+            try
+            {
+                var json = File.ReadAllText(file);
+                var backup = JsonConvert.DeserializeObject<BackupPost>(json);
+                if (backup == null) continue;
+
+                // Only need enough to match by ID check — we use slug for sync
+                // We don't have the original WP ID in backup, so we track by slug
+                if (_sourcePosts.Any(p => p.Slug == backup.Slug)) continue;
+
+                _sourcePosts.Add(new WpPost
+                {
+                    Slug = backup.Slug,
+                    Date = backup.Date,
+                    Title = new WpRendered { Rendered = backup.Title },
+                    Content = new WpRendered { Rendered = backup.Content },
+                    Excerpt = new WpRendered { Rendered = backup.Excerpt },
+                    Status = backup.Status
+                });
+            }
+            catch { /* skip corrupt files */ }
+        }
+
+        Console.WriteLine($"\r  Loaded {_sourcePosts.Count} posts from backup.                    ");
+    }
+
+    private async Task SaveTargetPostCache()
+    {
+        var cache = _targetPosts.Select(p => new { p.Id, p.Slug }).ToList();
+        await File.WriteAllTextAsync(
+            Path.Combine(_backupRoot, "target-cache.json"),
+            JsonConvert.SerializeObject(cache));
+    }
+
+    private void LoadTargetPostCache()
+    {
+        var path = Path.Combine(_backupRoot, "target-cache.json");
+        if (!File.Exists(path)) return;
+
+        try
+        {
+            var json = File.ReadAllText(path);
+            var cache = JsonConvert.DeserializeObject<List<IdSlug>>(json) ?? [];
+            Console.WriteLine($"  Loaded {cache.Count} target posts from cache.");
+
+            // Store as minimal Post objects for slug matching
+            foreach (var item in cache)
+            {
+                if (_targetPosts.Any(p => p.Id == item.Id)) continue;
+                _targetPosts.Add(new WpPost { Id = item.Id, Slug = item.Slug });
+            }
+        }
+        catch { /* ignore corrupt cache */ }
     }
 
     private async Task SaveMetadataToBackup()

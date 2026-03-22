@@ -2,7 +2,6 @@ using System.Net;
 using AngleSharp.Html.Parser;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using WordPressPCL.Models;
 
 namespace Holomove;
 
@@ -12,84 +11,31 @@ public partial class WpMigrator
     {
         Console.WriteLine("\n  Fetching source data...");
 
-        // Always refresh metadata (small)
-        _sourceAuthors = (await _sourceWp.Users.GetAllAsync()).ToList();
-        _sourceTags = (await _sourceWp.Tags.GetAllAsync()).ToList();
-        _sourceCategories = (await _sourceWp.Categories.GetAllAsync()).ToList();
-        Console.WriteLine($"  Source: {_sourceAuthors.Count} authors, {_sourceTags.Count} tags, {_sourceCategories.Count} categories");
+        Console.Write("  Loading metadata...");
+        _sourceAuthors = await FetchAllPaginated<WpUser>(_config.SourceWpApiUrl, "users");
+        _sourceTags = await FetchAllPaginated<WpTag>(_config.SourceWpApiUrl, "tags");
+        _sourceCategories = await FetchAllPaginated<WpCategory>(_config.SourceWpApiUrl, "categories");
+        Console.WriteLine($"\r  Source: {_sourceAuthors.Count} authors, {_sourceTags.Count} tags, {_sourceCategories.Count} categories");
 
-        // Fetch all post IDs
-        var allIds = await GetAllPostIds(_config.SourceWpApiUrl, useAuth: false);
-        Console.WriteLine($"  Source: {allIds.Count} posts on API");
-
-        // Only download posts we don't already have
-        var missingIds = allIds.Where(id => !_sourcePosts.Any(p => p.Id == id)).ToList();
-
-        if (missingIds.Count > 0)
-        {
-            Console.WriteLine($"  Downloading {missingIds.Count} new source posts...");
-            var progress = new ProgressBar();
-            for (var i = 0; i < missingIds.Count; i++)
-            {
-                progress.Update(i + 1, missingIds.Count, $"ID: {missingIds[i]}");
-                try
-                {
-                    var post = await _sourceWp.Posts.GetByIDAsync(missingIds[i]);
-                    _sourcePosts.Add(post);
-                }
-                catch { /* skip failed posts */ }
-            }
-            progress.Complete($"Downloaded {missingIds.Count} source post(s).");
-        }
-
-        Console.WriteLine($"  Total source posts: {_sourcePosts.Count}");
+        Console.WriteLine($"  {_sourcePosts.Count} posts in cache, fetching updates...");
+        await FetchPostsInBulk(_config.SourceWpApiUrl, _sourcePosts, useAuth: false);
+        Console.WriteLine($"  Source: {_sourcePosts.Count} posts loaded");
     }
 
     private async Task FetchTargetData()
     {
         Console.WriteLine("\n  Fetching target data...");
 
-        try
-        {
-            _targetAuthors = (await _targetWp.Users.GetAllAsync()).ToList();
-            _targetTags = (await _targetWp.Tags.GetAllAsync()).ToList();
-            _targetCategories = (await _targetWp.Categories.GetAllAsync()).ToList();
-        }
-        catch
-        {
-            _targetAuthors = await FetchAllFromApi<User>("users") ?? [];
-            _targetTags = await FetchAllFromApi<Tag>("tags") ?? [];
-            _targetCategories = await FetchAllFromApi<Category>("categories") ?? [];
-        }
+        Console.Write("  Loading metadata...");
+        _targetAuthors = await FetchAllPaginated<WpUser>(_config.TargetWpApiUrl, "users", useAuth: true);
+        _targetTags = await FetchAllPaginated<WpTag>(_config.TargetWpApiUrl, "tags", useAuth: true);
+        _targetCategories = await FetchAllPaginated<WpCategory>(_config.TargetWpApiUrl, "categories", useAuth: true);
+        Console.WriteLine($"\r  Target: {_targetAuthors.Count} authors, {_targetTags.Count} tags, {_targetCategories.Count} categories");
 
-        Console.WriteLine($"  Target: {_targetAuthors.Count} authors, {_targetTags.Count} tags, {_targetCategories.Count} categories");
-
-        // Fetch all target posts
-        _targetPosts.Clear();
-        var page = 1;
-        while (true)
-        {
-            try
-            {
-                var url = $"{_config.TargetWpApiUrl}wp/v2/posts?per_page=100&page={page}";
-                var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
-                var response = await _httpClient.SendAsync(request);
-
-                if (!response.IsSuccessStatusCode) break;
-
-                var json = await response.Content.ReadAsStringAsync();
-                var posts = JsonConvert.DeserializeObject<List<Post>>(json) ?? [];
-                if (posts.Count == 0) break;
-
-                _targetPosts.AddRange(posts);
-                var width = Math.Max(Console.WindowWidth, 80);
-                Console.Write($"\r  Fetching target posts: {_targetPosts.Count} (page {page})".PadRight(width - 1));
-                page++;
-            }
-            catch { break; }
-        }
-
-        Console.WriteLine($"\n  Total target posts: {_targetPosts.Count}");
+        Console.WriteLine($"  {_targetPosts.Count} posts in cache, fetching updates...");
+        await FetchPostsInBulk(_config.TargetWpApiUrl, _targetPosts, useAuth: true);
+        Console.WriteLine($"  Target: {_targetPosts.Count} posts loaded");
+        await SaveTargetPostCache();
     }
 
     private async Task SyncTaxonomy()
@@ -97,43 +43,45 @@ public partial class WpMigrator
         Console.WriteLine("\n  Syncing taxonomy...");
         var created = 0;
 
-        // Create missing tags
-        foreach (var sourceTag in _sourceTags.Where(sourceTag => !_targetTagsDict.ContainsKey(sourceTag.Slug)))
+        foreach (var sourceTag in _sourceTags.Where(st => !_targetTagsDict.ContainsKey(st.Slug)))
         {
-            try
+            var newTag = await CreateOnTarget<WpTag>("tags", new
             {
-                var newTag = await _targetWp.Tags.CreateAsync(new Tag
-                {
-                    Name = sourceTag.Name, Slug = sourceTag.Slug, Description = sourceTag.Description
-                });
+                name = sourceTag.Name, slug = sourceTag.Slug, description = sourceTag.Description ?? ""
+            });
+
+            if (newTag != null)
+            {
                 _targetTags.Add(newTag);
                 _targetTagsDict[newTag.Slug] = newTag;
                 created++;
             }
-            catch
+            else
             {
-                var existing = (await _targetWp.Tags.GetAllAsync(useAuth: true))
-                    .FirstOrDefault(t => t.Slug == sourceTag.Slug || t.Name == sourceTag.Name);
+                // May already exist — refresh and find it
+                var all = await FetchAllPaginated<WpTag>(_config.TargetWpApiUrl, "tags", useAuth: true);
+                var existing = all.FirstOrDefault(t => t.Slug == sourceTag.Slug || t.Name == sourceTag.Name);
                 if (existing != null) _targetTagsDict[existing.Slug] = existing;
             }
         }
 
-        // Create missing categories
-        foreach (var sourceCat in _sourceCategories.Where(sourceCat => !_targetCategoriesDict.ContainsKey(sourceCat.Slug)))
+        foreach (var sourceCat in _sourceCategories.Where(sc => !_targetCategoriesDict.ContainsKey(sc.Slug)))
         {
-            try
+            var newCat = await CreateOnTarget<WpCategory>("categories", new
             {
-                var newCat = await _targetWp.Categories.CreateAsync(new Category
-                {
-                    Name = sourceCat.Name, Slug = sourceCat.Slug, Description = sourceCat.Description
-                });
+                name = sourceCat.Name, slug = sourceCat.Slug, description = sourceCat.Description ?? ""
+            });
+
+            if (newCat != null)
+            {
                 _targetCategories.Add(newCat);
                 _targetCategoriesDict[newCat.Slug] = newCat;
                 created++;
             }
-            catch
+            else
             {
-                var existing = (await _targetWp.Categories.GetAllAsync(useAuth: true)).FirstOrDefault(c => c.Slug == sourceCat.Slug || c.Name == sourceCat.Name);
+                var all = await FetchAllPaginated<WpCategory>(_config.TargetWpApiUrl, "categories", useAuth: true);
+                var existing = all.FirstOrDefault(c => c.Slug == sourceCat.Slug || c.Name == sourceCat.Name);
                 if (existing != null) _targetCategoriesDict[existing.Slug] = existing;
             }
         }
@@ -180,9 +128,8 @@ public partial class WpMigrator
         progress.Complete($"Created {created}, updated {updated}, skipped {skipped} (already in sync).");
     }
 
-    private async Task CreatePostOnTarget(Post sourcePost)
+    private async Task CreatePostOnTarget(WpPost sourcePost)
     {
-        // Resolve tags
         var tagIds = sourcePost.Tags
             .Where(id => _sourceTagsDict.ContainsKey(id))
             .Select(id => _sourceTagsDict[id].Slug)
@@ -190,7 +137,6 @@ public partial class WpMigrator
             .Select(slug => _targetTagsDict[slug].Id)
             .ToList();
 
-        // Resolve categories
         var categoryIds = sourcePost.Categories
             .Where(id => _sourceCategoriesDict.ContainsKey(id))
             .Select(id => _sourceCategoriesDict[id].Slug)
@@ -198,22 +144,17 @@ public partial class WpMigrator
             .Select(slug => _targetCategoriesDict[slug].Id)
             .ToList();
 
-        // Process content (shortcodes + HTML cleanup, no URL rewriting)
         var content = sourcePost.Content.Rendered;
         content = ProcessShortcodes(content);
         content = CleanupHtml(content);
 
-        // Upload media to target (so files exist there)
         var uploadedMediaIds = await UploadAllPostMedia(sourcePost.Content.Rendered);
-
-        // Resolve author
         var authorId = ResolveTargetAuthorId(sourcePost.Author);
 
-        // Upload featured image
         int? featuredMediaId = null;
         if (sourcePost.FeaturedMedia > 0)
         {
-            var featuredUrl = await GetMediaUrl(sourcePost.FeaturedMedia.Value);
+            var featuredUrl = await GetMediaUrl(sourcePost.FeaturedMedia);
             if (featuredUrl != null)
             {
                 var uploaded = await UploadMedia(featuredUrl);
@@ -221,7 +162,6 @@ public partial class WpMigrator
             }
         }
 
-        // Prepare excerpt
         var excerpt = sourcePost.Excerpt.Rendered;
         if (!string.IsNullOrEmpty(excerpt))
         {
@@ -230,22 +170,21 @@ public partial class WpMigrator
             excerpt = WebUtility.HtmlDecode(doc.Body?.TextContent.Trim() ?? "");
         }
 
-        // Create post
-        var newPost = new Post
+        var createdPost = await CreateOnTarget<WpPost>("posts", new
         {
-            Title = new Title(WebUtility.HtmlDecode(sourcePost.Title.Rendered)),
-            Slug = sourcePost.Slug,
-            Content = new Content(content),
-            Excerpt = new Excerpt(excerpt ?? ""),
-            Status = sourcePost.Status,
-            Date = sourcePost.Date,
-            Tags = tagIds,
-            Categories = categoryIds,
-            Author = authorId,
-            FeaturedMedia = featuredMediaId
-        };
+            title = WebUtility.HtmlDecode(sourcePost.Title.Rendered),
+            slug = sourcePost.Slug,
+            content,
+            excerpt = excerpt ?? "",
+            status = sourcePost.Status,
+            date = sourcePost.Date,
+            tags = tagIds,
+            categories = categoryIds,
+            author = authorId,
+            featured_media = featuredMediaId ?? 0
+        });
 
-        var createdPost = await _targetWp.Posts.CreateAsync(newPost);
+        if (createdPost == null) return;
 
         // Attach media
         if (featuredMediaId.HasValue) uploadedMediaIds.Add(featuredMediaId.Value);
@@ -259,16 +198,14 @@ public partial class WpMigrator
         _targetPosts.Add(createdPost);
     }
 
-    private async Task<bool> UpdatePostIfNeeded(Post sourcePost, Post targetPost)
+    private async Task<bool> UpdatePostIfNeeded(WpPost sourcePost, WpPost targetPost)
     {
         var updates = new Dictionary<string, object>();
 
-        // Compare author
         var expectedAuthorId = ResolveTargetAuthorId(sourcePost.Author);
         if (targetPost.Author != expectedAuthorId)
             updates["author"] = expectedAuthorId;
 
-        // Compare tags
         var expectedTagIds = sourcePost.Tags
             .Where(id => _sourceTagsDict.ContainsKey(id))
             .Select(id => _sourceTagsDict[id].Slug)
@@ -278,7 +215,6 @@ public partial class WpMigrator
 
         if (!targetPost.Tags.OrderBy(x => x).SequenceEqual(expectedTagIds)) updates["tags"] = expectedTagIds;
 
-        // Compare categories
         var expectedCatIds = sourcePost.Categories
             .Where(id => _sourceCategoriesDict.ContainsKey(id))
             .Select(id => _sourceCategoriesDict[id].Slug)
@@ -288,10 +224,9 @@ public partial class WpMigrator
 
         if (!targetPost.Categories.OrderBy(x => x).SequenceEqual(expectedCatIds)) updates["categories"] = expectedCatIds;
 
-        // Compare featured media — upload if missing
-        if (sourcePost.FeaturedMedia > 0 && (targetPost.FeaturedMedia is null or 0))
+        if (sourcePost.FeaturedMedia > 0 && targetPost.FeaturedMedia == 0)
         {
-            var featuredUrl = await GetMediaUrl(sourcePost.FeaturedMedia.Value);
+            var featuredUrl = await GetMediaUrl(sourcePost.FeaturedMedia);
             if (featuredUrl != null)
             {
                 var uploaded = await UploadMedia(featuredUrl);
@@ -300,12 +235,10 @@ public partial class WpMigrator
             }
         }
 
-        // Upload content media to target (ensure files exist)
         await UploadAllPostMedia(sourcePost.Content.Rendered);
 
         if (updates.Count == 0) return false;
 
-        // Send single update
         var response = await PostJsonAsync($"{_config.TargetWpApiUrl}wp/v2/posts/{targetPost.Id}", updates);
         return response.IsSuccessStatusCode;
     }
@@ -313,7 +246,7 @@ public partial class WpMigrator
     private int ResolveTargetAuthorId(int sourceAuthorId)
     {
         if (!_sourceUsersDict.TryGetValue(sourceAuthorId, out var sourceAuthor))
-            return 1; // admin fallback
+            return 1;
 
         var targetAuthor = _targetAuthors.FirstOrDefault(a =>
             a.Slug.Equals(sourceAuthor.Slug, StringComparison.OrdinalIgnoreCase) ||
@@ -327,7 +260,7 @@ public partial class WpMigrator
         Console.WriteLine("\n  Checking for duplicates...");
 
         var targetPostsBySlug = _targetPosts.ToDictionary(p => p.Slug, p => p);
-        var duplicates = new List<Post>();
+        var duplicates = new List<WpPost>();
 
         foreach (var sourcePost in _sourcePosts)
         {
@@ -367,16 +300,18 @@ public partial class WpMigrator
         progress.Complete($"Deleted {duplicates.Count} duplicate(s).");
     }
 
-    private async Task<HashSet<int>> GetAllPostIds(string apiUrl, bool useAuth = false)
+    private async Task FetchPostsInBulk(string apiUrl, List<WpPost> targetList, bool useAuth = false)
     {
-        var allIds = new HashSet<int>();
+        var existingIds = targetList.Where(p => p.Id > 0).Select(p => p.Id).ToHashSet();
         var page = 1;
+        var width = Math.Max(Console.WindowWidth, 80);
+        var fetched = 0;
 
         while (true)
         {
             try
             {
-                var url = $"{apiUrl}wp/v2/posts?_fields=id&per_page=100&page={page}";
+                var url = $"{apiUrl}wp/v2/posts?per_page=100&page={page}";
 
                 HttpResponseMessage response;
                 if (useAuth)
@@ -392,16 +327,30 @@ public partial class WpMigrator
                 if (!response.IsSuccessStatusCode) break;
 
                 var json = await response.Content.ReadAsStringAsync();
-                var ids = JsonConvert.DeserializeObject<List<IdOnly>>(json) ?? [];
-                if (ids.Count == 0) break;
+                var posts = JsonConvert.DeserializeObject<List<WpPost>>(json) ?? [];
+                if (posts.Count == 0) break;
 
-                foreach (var id in ids) allIds.Add(id.Id);
+                foreach (var post in posts)
+                {
+                    if (existingIds.Contains(post.Id)) continue;
+
+                    var stubIndex = targetList.FindIndex(p => p.Slug == post.Slug && p.Id == 0);
+                    if (stubIndex >= 0)
+                        targetList[stubIndex] = post;
+                    else
+                        targetList.Add(post);
+
+                    existingIds.Add(post.Id);
+                    fetched++;
+                }
+
+                Console.Write($"\r  Downloading posts: {fetched} new (page {page})".PadRight(width - 1));
                 page++;
             }
             catch { break; }
         }
 
-        return allIds;
+        Console.WriteLine($"\r  Downloaded {fetched} posts in {page - 1} pages.".PadRight(width - 1));
     }
 
     private async Task<Dictionary<string, object>?> GetPostMeta(int postId)
@@ -441,19 +390,15 @@ public partial class WpMigrator
         switch (missing.Count)
         {
             case > 0 and <= 20:
-            {
                 Console.WriteLine("\n  Posts pending migration:");
                 foreach (var post in missing.OrderBy(p => p.Date))
                     Console.WriteLine($"    - {post.Slug} ({post.Date:yyyy-MM-dd})");
                 break;
-            }
             case > 20:
-            {
                 Console.WriteLine($"\n  First 20 posts pending migration:");
                 foreach (var post in missing.OrderBy(p => p.Date).Take(20))
                     Console.WriteLine($"    - {post.Slug} ({post.Date:yyyy-MM-dd})");
                 break;
-            }
         }
 
         return Task.CompletedTask;

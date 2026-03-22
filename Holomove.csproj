@@ -9,10 +9,7 @@
 
     <ItemGroup>
       <PackageReference Include="AngleSharp" Version="1.4.0" />
-      <PackageReference Include="Microsoft.IdentityModel.Tokens" Version="8.16.0" />
       <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
-      <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.16.0" />
-      <PackageReference Include="WordPressPCL" Version="2.1.0" />
     </ItemGroup>
 
 </Project>

@@ -37,8 +37,6 @@ public partial class WpMigrator
             Environment.Exit(1);
         }
 
-        _targetWp.Auth.SetJWToken(_jwtToken);
-
         var displayName = result["user_display_name"]?.ToString()
                        ?? result["name"]?.ToString()
                        ?? result["user"]?.ToString()
