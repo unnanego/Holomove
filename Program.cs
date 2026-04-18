@@ -27,6 +27,10 @@ while (true)
     Console.ResetColor();
     Console.WriteLine("Sync source → backup → target (idempotent)");
     Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.Write("    repair   ");
+    Console.ResetColor();
+    Console.WriteLine("Fix content URLs + missing featured images (fast)");
+    Console.ForegroundColor = ConsoleColor.Cyan;
     Console.Write("    status   ");
     Console.ResetColor();
     Console.WriteLine("Compare source vs target, show progress");
@@ -57,6 +61,9 @@ while (true)
         {
             case "migrate":
                 await migrator.Migrate();
+                break;
+            case "repair":
+                await migrator.Repair();
                 break;
             case "status":
                 await migrator.Status();

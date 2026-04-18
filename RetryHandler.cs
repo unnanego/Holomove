@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 
 namespace Holomove;
 
@@ -6,16 +7,42 @@ public class RetryHandler(HttpMessageHandler innerHandler) : DelegatingHandler(i
 {
     public int MaxRetries { get; init; } = 3;
 
+    /// <summary>
+    /// Invoked on 401 Unauthorized. Returns a fresh bearer token, or null to skip.
+    /// Called at most once per request (across all retries).
+    /// </summary>
+    public Func<Task<string?>>? ReauthAsync { get; set; }
+
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         HttpResponseMessage? response = null;
+        var currentToken = request.Headers.Authorization?.Parameter;
+        var didReauth = false;
 
         for (var i = 0; i <= MaxRetries; i++)
         {
             try
             {
                 var clonedRequest = await CloneRequest(request);
+                if (!string.IsNullOrEmpty(currentToken))
+                    clonedRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", currentToken);
+
                 response = await base.SendAsync(clonedRequest, cancellationToken);
+
+                // Expired JWT? Re-auth once and retry.
+                if (response.StatusCode == HttpStatusCode.Unauthorized &&
+                    !didReauth && ReauthAsync != null && !string.IsNullOrEmpty(currentToken) &&
+                    i < MaxRetries)
+                {
+                    didReauth = true;
+                    var newToken = await ReauthAsync();
+                    if (!string.IsNullOrEmpty(newToken))
+                    {
+                        currentToken = newToken;
+                        response.Dispose();
+                        continue;
+                    }
+                }
 
                 if (response.IsSuccessStatusCode
                     || (int)response.StatusCode < 500 && response.StatusCode != HttpStatusCode.TooManyRequests

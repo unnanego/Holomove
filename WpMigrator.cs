@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Text.RegularExpressions;
 using Newtonsoft.Json;
 
 namespace Holomove;
@@ -27,19 +29,54 @@ public partial class WpMigrator
     private Dictionary<string, WpTag> _targetTagsDict = new();
     private Dictionary<string, WpCategory> _targetCategoriesDict = new();
 
-    // Target media lookup
-    private readonly Dictionary<string, MediaItem> _targetMediaByUrl = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, MediaItem> _targetMediaByFilename = new(StringComparer.OrdinalIgnoreCase);
+    // Target media lookup (concurrent — written during parallel uploads)
+    private readonly ConcurrentDictionary<string, MediaItem> _targetMediaByUrl = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, MediaItem> _targetMediaByFilename = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<int, bool> _targetMediaIds = new();
 
-    // Backup media data (slug -> URLs) for posts loaded from backup
-    private readonly Dictionary<string, string> _backupFeaturedMediaUrls = new();
-    private readonly Dictionary<string, List<string>> _backupMediaUrls = new();
+    // Source media URL lookup by ID (built once from featured_media IDs in source posts)
+    private readonly ConcurrentDictionary<int, string> _sourceMediaById = new();
+
+    // Upload failure log (first N shown at end of run)
+    private readonly ConcurrentBag<string> _uploadErrors = new();
+
+    // Serialize re-auth on 401
+    private readonly SemaphoreSlim _authLock = new(1, 1);
+
+    // Backup media data (slug -> URLs) — written in parallel during SavePostToBackup
+    private readonly ConcurrentDictionary<string, string> _backupFeaturedMediaUrls = new();
+    private readonly ConcurrentDictionary<string, List<string>> _backupMediaUrls = new();
+
+    // Backup file index (filename -> full path) for O(1) lookups
+    private Dictionary<string, string> _backupFileIndex = new(StringComparer.OrdinalIgnoreCase);
+
+    // Target author lookup by slug/name
+    private Dictionary<string, WpUser> _targetAuthorsBySlug = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, WpUser> _targetAuthorsByName = new(StringComparer.OrdinalIgnoreCase);
+
+    // Posts verified as fully synced — skip on subsequent runs
+    private readonly ConcurrentDictionary<string, bool> _verifiedPosts = new(StringComparer.OrdinalIgnoreCase);
 
     public WpMigrator(SiteConfig config)
     {
         _config = config;
-        var retryHandler = new RetryHandler(new HttpClientHandler()) { MaxRetries = 3 };
+        var retryHandler = new RetryHandler(new HttpClientHandler())
+        {
+            MaxRetries = 3,
+            ReauthAsync = ReauthAsync
+        };
         _httpClient = new HttpClient(retryHandler) { Timeout = TimeSpan.FromMinutes(30) };
+    }
+
+    private async Task<string?> ReauthAsync()
+    {
+        await _authLock.WaitAsync();
+        try
+        {
+            await Authenticate();
+            return _jwtToken;
+        }
+        finally { _authLock.Release(); }
     }
 
     public async Task Init()
@@ -48,6 +85,7 @@ public partial class WpMigrator
         InitBackup();
         LoadSourcePostsFromBackup();
         LoadTargetPostCache();
+        LoadVerifiedPostsCache();
     }
 
     public async Task Migrate()
@@ -81,6 +119,8 @@ public partial class WpMigrator
         await SaveTaxonomyToBackup();
         await SaveMetadataToBackup();
 
+        BuildBackupFileIndex();
+
         // 3. Fetch target data
         await FetchTargetData();
         await DownloadTargetMediaList();
@@ -96,8 +136,42 @@ public partial class WpMigrator
         // 5. Cleanup
         await FindAndDeleteDuplicates();
         SaveTargetMediaCache();
+        SaveVerifiedPostsCache();
 
+        ReportUploadErrors();
         Console.WriteLine("\n  Migration complete!");
+    }
+
+    public async Task Repair()
+    {
+        _verifiedPosts.Clear();
+
+        // Only need backup index + target data — skip source fetch & backup phases
+        BuildBackupFileIndex();
+
+        await FetchTargetData();
+        await DownloadTargetMediaList();
+        BuildLookupDictionaries();
+
+        await RepairAllPosts();
+
+        SaveTargetMediaCache();
+        SaveVerifiedPostsCache();
+
+        ReportUploadErrors();
+        Console.WriteLine("\n  Repair complete!");
+    }
+
+    private void ReportUploadErrors()
+    {
+        if (_uploadErrors.IsEmpty) return;
+
+        var distinct = _uploadErrors.Distinct().ToList();
+        Console.WriteLine($"\n  {distinct.Count} upload error(s):");
+        foreach (var err in distinct.Take(20))
+            Console.WriteLine($"    - {err}");
+        if (distinct.Count > 20)
+            Console.WriteLine($"    … and {distinct.Count - 20} more");
     }
 
     public async Task Status()
@@ -124,40 +198,60 @@ public partial class WpMigrator
         return await _httpClient.SendAsync(request);
     }
 
-    private async Task<List<T>> FetchAllPaginated<T>(string apiUrl, string endpoint, bool useAuth = false)
+    /// <summary>
+    /// Fetch one page from a WP REST endpoint. Returns items and the X-WP-TotalPages value.
+    /// </summary>
+    private async Task<(List<T> Items, int TotalPages)> FetchPageAsync<T>(
+        string apiUrl, string endpoint, int page, bool useAuth = false, string? extraQuery = null)
     {
-        var all = new List<T>();
-        var page = 1;
-
-        while (true)
+        try
         {
-            try
-            {
-                var url = $"{apiUrl}wp/v2/{endpoint}?per_page=100&page={page}";
+            var url = $"{apiUrl}wp/v2/{endpoint}?per_page=100&page={page}";
+            if (!string.IsNullOrEmpty(extraQuery)) url += $"&{extraQuery}";
 
-                HttpResponseMessage response;
-                if (useAuth)
-                {
-                    var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
-                    response = await _httpClient.SendAsync(request);
-                }
-                else
-                {
-                    response = await _httpClient.GetAsync(url);
-                }
+            var response = useAuth
+                ? await _httpClient.SendAsync(CreateAuthenticatedRequest(HttpMethod.Get, url))
+                : await _httpClient.GetAsync(url);
 
-                if (!response.IsSuccessStatusCode) break;
+            if (!response.IsSuccessStatusCode) return ([], 0);
 
-                var json = await response.Content.ReadAsStringAsync();
-                var items = JsonConvert.DeserializeObject<List<T>>(json) ?? [];
-                if (items.Count == 0) break;
+            var totalPages = 1;
+            if (response.Headers.TryGetValues("X-WP-TotalPages", out var values) &&
+                int.TryParse(values.FirstOrDefault(), out var tp))
+                totalPages = tp;
 
-                all.AddRange(items);
-                page++;
-            }
-            catch { break; }
+            var json = await response.Content.ReadAsStringAsync();
+            var items = JsonConvert.DeserializeObject<List<T>>(json) ?? [];
+            return (items, totalPages);
         }
+        catch
+        {
+            return ([], 0);
+        }
+    }
 
+    /// <summary>
+    /// Fetch all pages from a WP REST endpoint in parallel. Uses X-WP-TotalPages from page 1.
+    /// </summary>
+    private async Task<List<T>> FetchAllPaginated<T>(string apiUrl, string endpoint, bool useAuth = false, string? extraQuery = null)
+    {
+        var (firstItems, totalPages) = await FetchPageAsync<T>(apiUrl, endpoint, 1, useAuth, extraQuery);
+        if (totalPages <= 1) return firstItems;
+
+        var pageResults = new List<T>?[totalPages + 1];
+        pageResults[1] = firstItems;
+
+        await Parallel.ForEachAsync(Enumerable.Range(2, totalPages - 1),
+            new ParallelOptions { MaxDegreeOfParallelism = 6 },
+            async (page, _) =>
+            {
+                var (items, _) = await FetchPageAsync<T>(apiUrl, endpoint, page, useAuth, extraQuery);
+                pageResults[page] = items;
+            });
+
+        var all = new List<T>(firstItems.Count * totalPages);
+        for (var i = 1; i <= totalPages; i++)
+            if (pageResults[i] != null) all.AddRange(pageResults[i]!);
         return all;
     }
 
@@ -179,6 +273,78 @@ public partial class WpMigrator
         _sourceCategoriesDict = _sourceCategories.ToDictionary(c => c.Id);
         _targetTagsDict = _targetTags.ToDictionary(t => t.Slug);
         _targetCategoriesDict = _targetCategories.ToDictionary(c => c.Slug);
+        _targetAuthorsBySlug = _targetAuthors.ToDictionary(a => a.Slug, StringComparer.OrdinalIgnoreCase);
+        _targetAuthorsByName = _targetAuthors
+            .GroupBy(a => a.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    private void BuildBackupFileIndex()
+    {
+        var postsDir = Path.Combine(_backupRoot, "posts");
+        if (!Directory.Exists(postsDir)) return;
+
+        var index = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in Directory.EnumerateFiles(postsDir, "*.*", SearchOption.AllDirectories))
+        {
+            var name = Path.GetFileName(file);
+            if (name == "post.json") continue;
+            index.TryAdd(name, file);
+        }
+
+        _backupFileIndex = index;
+        Console.WriteLine($"  Indexed {index.Count} backup media files.");
+    }
+
+    private string RewriteContentUrls(string content)
+    {
+        if (string.IsNullOrEmpty(content)) return content;
+
+        // Match all source-domain media URLs (covers src, srcset, href, etc.)
+        var pattern = Regex.Escape(_config.SourceWpUrl) + @"/wp-content/uploads/[^\s""'<>\)]+";
+
+        return Regex.Replace(content, pattern, match =>
+        {
+            var sourceUrl = match.Value;
+            try
+            {
+                var fileName = Path.GetFileName(new Uri(sourceUrl).LocalPath);
+
+                // Exact filename match → use actual target URL
+                if (_targetMediaByFilename.TryGetValue(fileName, out var media) &&
+                    !string.IsNullOrEmpty(media.SourceUrl))
+                    return media.SourceUrl;
+
+                // Size variant (photo-300x200.jpg) → derive from base file's target path
+                var sizeMatch = Regex.Match(fileName, @"^(.+)-\d+x\d+(\.[^.]+)$");
+                if (sizeMatch.Success)
+                {
+                    var baseFileName = sizeMatch.Groups[1].Value + sizeMatch.Groups[2].Value;
+                    if (_targetMediaByFilename.TryGetValue(baseFileName, out var baseMedia) &&
+                        !string.IsNullOrEmpty(baseMedia.SourceUrl))
+                    {
+                        var lastSlash = baseMedia.SourceUrl.LastIndexOf('/');
+                        if (lastSlash >= 0)
+                            return baseMedia.SourceUrl[..lastSlash] + "/" + fileName;
+                    }
+                }
+            }
+            catch { /* leave URL unchanged */ }
+
+            return sourceUrl;
+        });
+    }
+
+    private void TrackTargetMedia(MediaItem media)
+    {
+        if (media.Id > 0) _targetMediaIds[media.Id] = true;
+        if (!string.IsNullOrEmpty(media.SourceUrl))
+        {
+            _targetMediaByUrl[media.SourceUrl] = media;
+            var filename = Path.GetFileName(new Uri(media.SourceUrl).LocalPath);
+            if (!string.IsNullOrEmpty(filename))
+                _targetMediaByFilename[filename] = media;
+        }
     }
 
     private static string GetMimeType(string fileName)

@@ -55,10 +55,19 @@ public partial class WpMigrator
             .Where(IsSourceMedia)
             .ToList();
 
-        // Get featured media URL
+        // Get featured media URL — prefer in-memory index (no extra API call)
         string? featuredUrl = null;
         if (post.FeaturedMedia > 0)
-            featuredUrl = await GetMediaUrl(post.FeaturedMedia);
+        {
+            if (!_sourceMediaById.TryGetValue(post.FeaturedMedia, out featuredUrl))
+                featuredUrl = await GetMediaUrl(post.FeaturedMedia);
+        }
+
+        // Populate in-memory lookup so creation/update within same run can find featured image
+        if (!string.IsNullOrEmpty(featuredUrl))
+            _backupFeaturedMediaUrls[post.Slug] = featuredUrl;
+        if (mediaUrls.Count > 0)
+            _backupMediaUrls[post.Slug] = mediaUrls;
 
         // Prepare excerpt
         var excerpt = post.Excerpt.Rendered;
@@ -82,7 +91,7 @@ public partial class WpMigrator
             CategoryNames = categoryNames,
             FeaturedMediaUrl = featuredUrl,
             MediaUrls = mediaUrls,
-            Meta = await GetPostMeta(post.Id)
+            Meta = post.Meta ?? await GetPostMeta(post.Id)
         };
 
         var json = JsonConvert.SerializeObject(backupPost, Formatting.Indented);
@@ -148,18 +157,17 @@ public partial class WpMigrator
 
     private async Task SyncAllBackupMedia()
     {
-        // Collect all slugs that have any media
+        var postsBySlug = _sourcePosts.ToDictionary(p => p.Slug, p => p);
+
+        // Collect all (url, mediaFolder) pairs that need downloading
         var slugsWithMedia = new HashSet<string>(_backupMediaUrls.Keys);
         foreach (var slug in _backupFeaturedMediaUrls.Keys)
             slugsWithMedia.Add(slug);
 
-        var downloaded = 0;
-        var postsBySlug = _sourcePosts.ToDictionary(p => p.Slug, p => p);
-
+        var toDownload = new List<(string Url, string Folder)>();
         foreach (var slug in slugsWithMedia)
         {
             if (!postsBySlug.TryGetValue(slug, out var post)) continue;
-
             var mediaFolder = Path.Combine(GetPostBackupFolder(post), "media");
 
             var allUrls = new List<string>();
@@ -171,13 +179,22 @@ public partial class WpMigrator
             foreach (var url in allUrls.Distinct())
             {
                 var fileName = Path.GetFileName(new Uri(url).LocalPath);
-                if (File.Exists(Path.Combine(mediaFolder, fileName))) continue;
-
-                await DownloadMediaToDisk(url, mediaFolder);
-                if (File.Exists(Path.Combine(mediaFolder, fileName)))
-                    downloaded++;
+                if (!File.Exists(Path.Combine(mediaFolder, fileName)))
+                    toDownload.Add((url, mediaFolder));
             }
         }
+
+        if (toDownload.Count == 0) return;
+
+        var downloaded = 0;
+        await Parallel.ForEachAsync(toDownload, new ParallelOptions { MaxDegreeOfParallelism = 5 },
+            async (item, _) =>
+            {
+                await DownloadMediaToDisk(item.Url, item.Folder);
+                var fileName = Path.GetFileName(new Uri(item.Url).LocalPath);
+                if (File.Exists(Path.Combine(item.Folder, fileName)))
+                    Interlocked.Increment(ref downloaded);
+            });
 
         if (downloaded > 0)
             Console.WriteLine($"  Downloaded {downloaded} missing media file(s) to backup.");
@@ -217,6 +234,8 @@ public partial class WpMigrator
 
         Console.Write($"  Loading {postFiles.Length} posts from backup...");
 
+        var loadedSlugs = _sourcePosts.Select(p => p.Slug).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
         foreach (var file in postFiles)
         {
             try
@@ -230,9 +249,7 @@ public partial class WpMigrator
                 if (backup.MediaUrls.Count > 0)
                     _backupMediaUrls[backup.Slug] = backup.MediaUrls;
 
-                // Only need enough to match by ID check — we use slug for sync
-                // We don't have the original WP ID in backup, so we track by slug
-                if (_sourcePosts.Any(p => p.Slug == backup.Slug)) continue;
+                if (!loadedSlugs.Add(backup.Slug)) continue;
 
                 _sourcePosts.Add(new WpPost
                 {
@@ -279,6 +296,30 @@ public partial class WpMigrator
             }
         }
         catch { /* ignore corrupt cache */ }
+    }
+
+    private void LoadVerifiedPostsCache()
+    {
+        var path = Path.Combine(_backupRoot, "verified-posts.json");
+        if (!File.Exists(path)) return;
+
+        try
+        {
+            var json = File.ReadAllText(path);
+            var slugs = JsonConvert.DeserializeObject<List<string>>(json) ?? [];
+            foreach (var slug in slugs)
+                _verifiedPosts[slug] = true;
+            Console.WriteLine($"  Loaded {slugs.Count} verified posts from cache.");
+        }
+        catch { /* ignore corrupt cache */ }
+    }
+
+    private void SaveVerifiedPostsCache()
+    {
+        var slugs = _verifiedPosts.Keys.OrderBy(s => s).ToList();
+        File.WriteAllText(
+            Path.Combine(_backupRoot, "verified-posts.json"),
+            JsonConvert.SerializeObject(slugs));
     }
 
     private async Task SaveMetadataToBackup()

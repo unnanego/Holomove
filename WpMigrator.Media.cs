@@ -1,7 +1,7 @@
+using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
 using System.Net.Http.Headers;
 using System.Text.RegularExpressions;
-using AngleSharp.Html.Parser;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -13,63 +13,88 @@ public partial class WpMigrator
     {
         LoadTargetMediaCache();
 
-        var existingIds = _targetMediaByUrl.Values.Select(m => m.Id).ToHashSet();
-        var page = 1;
+        Console.Write("  Checking for new media on target...");
         var fetched = 0;
 
-        Console.Write("  Checking for new media on target...");
+        // Page 1 reveals totalPages. Remaining pages fetched in parallel.
+        var (firstPage, totalPages) = await FetchPageAsync<MediaItem>(
+            _config.TargetWpApiUrl, "media", 1, useAuth: true, extraQuery: "_fields=id,source_url");
 
-        while (true)
+        foreach (var media in firstPage)
         {
-            try
-            {
-                var url = $"{_config.TargetWpApiUrl}wp/v2/media?per_page=100&page={page}&_fields=id,source_url";
-                var request = CreateAuthenticatedRequest(HttpMethod.Get, url);
-                var response = await _httpClient.SendAsync(request);
+            if (_targetMediaIds.ContainsKey(media.Id)) continue;
+            TrackTargetMedia(media);
+            fetched++;
+        }
 
-                if (!response.IsSuccessStatusCode)
+        if (totalPages > 1)
+        {
+            var pagesDone = 1;
+            await Parallel.ForEachAsync(Enumerable.Range(2, totalPages - 1),
+                new ParallelOptions { MaxDegreeOfParallelism = 6 },
+                async (page, _) =>
                 {
-                    if (response.StatusCode == System.Net.HttpStatusCode.BadRequest)
-                        break;
-                    Console.WriteLine($"\n  Error fetching media page {page}: {response.StatusCode}");
-                    break;
-                }
-
-                var json = await response.Content.ReadAsStringAsync();
-                var mediaItems = JsonConvert.DeserializeObject<List<MediaItem>>(json) ?? [];
-
-                if (mediaItems.Count == 0) break;
-
-                var newOnPage = 0;
-                foreach (var media in mediaItems)
-                {
-                    if (existingIds.Contains(media.Id)) continue;
-
-                    if (!string.IsNullOrEmpty(media.SourceUrl))
+                    var (items, _) = await FetchPageAsync<MediaItem>(
+                        _config.TargetWpApiUrl, "media", page, useAuth: true, extraQuery: "_fields=id,source_url");
+                    foreach (var media in items)
                     {
-                        _targetMediaByUrl[media.SourceUrl] = media;
-
-                        var filename = Path.GetFileName(new Uri(media.SourceUrl).LocalPath);
-                        if (!string.IsNullOrEmpty(filename))
-                            _targetMediaByFilename[filename] = media;
+                        if (_targetMediaIds.ContainsKey(media.Id)) continue;
+                        TrackTargetMedia(media);
+                        Interlocked.Increment(ref fetched);
                     }
-                    existingIds.Add(media.Id);
-                    fetched++;
-                    newOnPage++;
-                }
-
-                if (newOnPage == 0) break;
-                page++;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"\n  Error on media page {page}: {ex.Message}");
-                break;
-            }
+                    var done = Interlocked.Increment(ref pagesDone);
+                    Console.Write($"\r  Target media: page {done}/{totalPages} ({_targetMediaByUrl.Count} items)".PadRight(78));
+                });
         }
 
         Console.WriteLine($"\r  Target media: {_targetMediaByUrl.Count} items ({fetched} new)                    ");
         if (fetched > 0) SaveTargetMediaCache();
+    }
+
+    /// <summary>
+    /// Build an in-memory map from source featured_media IDs to their source_url,
+    /// fetched in batches of 100 via ?include=… — replaces N per-post GetMediaUrl calls.
+    /// </summary>
+    private async Task BuildSourceMediaIndex()
+    {
+        var ids = _sourcePosts
+            .Select(p => p.FeaturedMedia)
+            .Where(id => id > 0 && !_sourceMediaById.ContainsKey(id))
+            .Distinct()
+            .ToList();
+
+        if (ids.Count == 0) return;
+
+        Console.Write($"  Resolving {ids.Count} featured media URLs...");
+
+        var batches = ids.Chunk(100).ToList();
+        var resolved = 0;
+
+        await Parallel.ForEachAsync(batches, new ParallelOptions { MaxDegreeOfParallelism = 6 },
+            async (batch, _) =>
+            {
+                var csv = string.Join(",", batch);
+                var url = $"{_config.SourceWpApiUrl}wp/v2/media?include={csv}&per_page=100&_fields=id,source_url";
+                try
+                {
+                    var response = await _httpClient.GetAsync(url);
+                    if (!response.IsSuccessStatusCode) return;
+
+                    var json = await response.Content.ReadAsStringAsync();
+                    var items = JsonConvert.DeserializeObject<List<MediaItem>>(json) ?? [];
+                    foreach (var item in items)
+                    {
+                        if (!string.IsNullOrEmpty(item.SourceUrl))
+                        {
+                            _sourceMediaById[item.Id] = item.SourceUrl;
+                            Interlocked.Increment(ref resolved);
+                        }
+                    }
+                }
+                catch { /* ignore — GetMediaUrl fallback will handle individually */ }
+            });
+
+        Console.WriteLine($"\r  Resolved {resolved} featured media URLs ({batches.Count} batches).".PadRight(60));
     }
 
     private void LoadTargetMediaCache()
@@ -85,11 +110,7 @@ public partial class WpMigrator
             foreach (var media in cache)
             {
                 if (string.IsNullOrEmpty(media.SourceUrl)) continue;
-                _targetMediaByUrl[media.SourceUrl] = media;
-
-                var filename = Path.GetFileName(new Uri(media.SourceUrl).LocalPath);
-                if (!string.IsNullOrEmpty(filename))
-                    _targetMediaByFilename[filename] = media;
+                TrackTargetMedia(media);
             }
 
             Console.WriteLine($"  Loaded {cache.Count} target media items from cache.");
@@ -184,8 +205,12 @@ public partial class WpMigrator
             }
 
             // Only upload from backup — never directly from source
-            var backupFile = FindInBackup(originalFileName);
-            if (backupFile == null) return null;
+            var backupFile = FindInBackup(originalFileName) ?? FindInBackup(fileName);
+            if (backupFile == null)
+            {
+                _uploadErrors.Add($"{originalFileName}: not in backup");
+                return null;
+            }
 
             var mediaBytes = await File.ReadAllBytesAsync(backupFile);
 
@@ -206,21 +231,25 @@ public partial class WpMigrator
             var response = await _httpClient.SendAsync(request);
             var json = await response.Content.ReadAsStringAsync();
 
-            if (!response.IsSuccessStatusCode) return null;
+            if (!response.IsSuccessStatusCode)
+            {
+                _uploadErrors.Add($"{fileName}: HTTP {(int)response.StatusCode} — {Truncate(json, 200)}");
+                return null;
+            }
 
             var result = JsonConvert.DeserializeObject<MediaItem>(json);
-
-            if (result == null || string.IsNullOrEmpty(result.SourceUrl)) return result;
-            _targetMediaByUrl[result.SourceUrl] = result;
-            _targetMediaByFilename[fileName] = result;
-
+            if (result != null) TrackTargetMedia(result);
             return result;
         }
-        catch
+        catch (Exception ex)
         {
+            _uploadErrors.Add($"{sourceUrl}: {ex.Message}");
             return null;
         }
     }
+
+    private static string Truncate(string s, int max) =>
+        string.IsNullOrEmpty(s) ? "" : s.Length <= max ? s : s[..max] + "…";
 
     private async Task AttachMediaToPost(int mediaId, int postId)
     {
@@ -233,13 +262,8 @@ public partial class WpMigrator
 
     private string? FindInBackup(string fileName)
     {
-        if (string.IsNullOrEmpty(_backupRoot)) return null;
-
-        var postsDir = Path.Combine(_backupRoot, "posts");
-        if (!Directory.Exists(postsDir)) return null;
-
-        var matches = Directory.GetFiles(postsDir, fileName, SearchOption.AllDirectories);
-        return matches.FirstOrDefault();
+        if (string.IsNullOrEmpty(fileName)) return null;
+        return _backupFileIndex.TryGetValue(fileName, out var path) ? path : null;
     }
 
     private MediaItem? FindMediaOnTarget(string sourceUrl)
@@ -276,33 +300,26 @@ public partial class WpMigrator
     [GeneratedRegex(@"[^\u0000-\u007F]+")]
     private static partial Regex NonAsciiRegex();
 
+    [GeneratedRegex("""<(?:img|video|source)\b[^>]*?\ssrc\s*=\s*["']([^"'<>]+)["']""",
+        RegexOptions.IgnoreCase, "en-AE")]
+    private static partial Regex MediaSrcRegex();
+
+    [GeneratedRegex("""<a\b[^>]*?\shref\s*=\s*["']([^"'<>]+\.(?:pdf|docx?|xlsx?|pptx?|zip|rar)(?:\?[^"'<>]*)?)["']""",
+        RegexOptions.IgnoreCase, "en-AE")]
+    private static partial Regex DocumentLinkRegex();
+
     private static List<string> ExtractMediaUrls(string content)
     {
-        var urls = new List<string>();
-        var parser = new HtmlParser();
-        var doc = parser.ParseDocument($"<body>{content}</body>");
+        if (string.IsNullOrEmpty(content)) return [];
 
-        foreach (var img in doc.QuerySelectorAll("img[src]"))
-        {
-            var src = img.GetAttribute("src");
-            if (!string.IsNullOrEmpty(src)) urls.Add(src);
-        }
+        var urls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var source in doc.QuerySelectorAll("video source[src], video[src]"))
-        {
-            var src = source.GetAttribute("src");
-            if (!string.IsNullOrEmpty(src)) urls.Add(src);
-        }
+        foreach (Match m in MediaSrcRegex().Matches(content))
+            urls.Add(m.Groups[1].Value);
 
-        foreach (var anchor in doc.QuerySelectorAll("a[href]"))
-        {
-            var href = anchor.GetAttribute("href");
-            if (string.IsNullOrEmpty(href)) continue;
-            var ext = Path.GetExtension(href).ToLower().Split('?')[0];
-            if (ext is ".pdf" or ".doc" or ".docx" or ".xls" or ".xlsx" or ".ppt" or ".pptx" or ".zip" or ".rar")
-                urls.Add(href);
-        }
+        foreach (Match m in DocumentLinkRegex().Matches(content))
+            urls.Add(m.Groups[1].Value);
 
-        return urls.Distinct().ToList();
+        return urls.ToList();
     }
 }

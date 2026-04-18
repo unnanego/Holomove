@@ -9,6 +9,7 @@ public class WpPost
     [JsonProperty("id")] public int Id { get; set; }
     [JsonProperty("slug")] public string Slug { get; set; } = "";
     [JsonProperty("date")] public DateTime Date { get; set; }
+    [JsonProperty("modified")] public DateTime Modified { get; set; }
     [JsonProperty("status")] public string Status { get; set; } = "publish";
     [JsonProperty("title")] public WpRendered Title { get; set; } = new();
     [JsonProperty("content")] public WpRendered Content { get; set; } = new();
@@ -17,6 +18,7 @@ public class WpPost
     [JsonProperty("featured_media")] public int FeaturedMedia { get; set; }
     [JsonProperty("tags")] public List<int> Tags { get; set; } = [];
     [JsonProperty("categories")] public List<int> Categories { get; set; } = [];
+    [JsonProperty("meta")] public Dictionary<string, object>? Meta { get; set; }
 }
 
 public class WpRendered
