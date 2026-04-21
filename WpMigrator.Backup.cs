@@ -143,14 +143,19 @@ public partial class WpMigrator
             Directory.CreateDirectory(targetFolder);
 
             using var response = await _httpClient.GetAsync(sourceUrl, HttpCompletionOption.ResponseHeadersRead);
-            if (!response.IsSuccessStatusCode) return;
+            if (!response.IsSuccessStatusCode)
+            {
+                _uploadErrors.Add($"{fileName}: backup download HTTP {(int)response.StatusCode} from {sourceUrl}");
+                return;
+            }
 
             await using var stream = await response.Content.ReadAsStreamAsync();
             await using var file = File.Create(filePath);
             await stream.CopyToAsync(file);
         }
-        catch
+        catch (Exception ex)
         {
+            _uploadErrors.Add($"{Path.GetFileName(new Uri(sourceUrl).LocalPath)}: backup download failed — {ex.Message}");
             // Skip failed media downloads silently for backup
         }
     }

@@ -168,10 +168,8 @@ public partial class WpMigrator
 
         var distinct = _uploadErrors.Distinct().ToList();
         Console.WriteLine($"\n  {distinct.Count} upload error(s):");
-        foreach (var err in distinct.Take(20))
+        foreach (var err in distinct)
             Console.WriteLine($"    - {err}");
-        if (distinct.Count > 20)
-            Console.WriteLine($"    … and {distinct.Count - 20} more");
     }
 
     public async Task Status()

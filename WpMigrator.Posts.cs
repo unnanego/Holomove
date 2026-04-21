@@ -103,7 +103,8 @@ public partial class WpMigrator
 
     /// <summary>
     /// Find target post for a source slug. Handles WP slug collisions where target
-    /// got "{slug}-N" suffix (matches N in [2..19] with same date).
+    /// got "{slug}-N" suffix. Dates are compared with 24h tolerance because source
+    /// and target WP may store dates in different timezones (REST converts on save).
     /// </summary>
     private static WpPost? FindTargetForSource(WpPost source, Dictionary<string, WpPost> targetBySlug)
     {
@@ -111,7 +112,7 @@ public partial class WpMigrator
         for (var n = 2; n <= 19; n++)
         {
             if (targetBySlug.TryGetValue($"{source.Slug}-{n}", out var suffixed) &&
-                suffixed.Date == source.Date)
+                Math.Abs((suffixed.Date - source.Date).TotalHours) < 24)
                 return suffixed;
         }
         return null;
