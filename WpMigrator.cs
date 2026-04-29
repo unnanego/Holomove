@@ -38,7 +38,7 @@ public partial class WpMigrator
     private readonly ConcurrentDictionary<int, string> _sourceMediaById = new();
 
     // Upload failure log (first N shown at end of run)
-    private readonly ConcurrentBag<string> _uploadErrors = new();
+    private readonly ConcurrentBag<string> _uploadErrors = [];
 
     // Serialize re-auth on 401
     private readonly SemaphoreSlim _authLock = new(1, 1);

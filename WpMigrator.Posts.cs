@@ -23,7 +23,7 @@ public partial class WpMigrator
 
         Console.WriteLine($"  {_sourcePosts.Count} posts from backup, fetching updates...");
         await FetchPostsInBulk(_config.SourceWpApiUrl, _sourcePosts, useAuth: false,
-            fields: "id,slug,date,modified,status,title,content,excerpt,author,featured_media,tags,categories,meta");
+            fields: "id,slug,link,date,modified,status,title,content,excerpt,author,featured_media,tags,categories,meta");
         Console.WriteLine($"  Source: {_sourcePosts.Count} posts loaded");
 
         await BuildSourceMediaIndex();
@@ -208,7 +208,7 @@ public partial class WpMigrator
                             // Upload any missing media first so URL mapping is populated
                             var missingMedia = FindMissingMedia(sourcePost.Slug);
                             if (missingMedia.Count > 0)
-                                await UploadAllPostMedia(sourcePost.Content.Rendered, targetPost.Id);
+                                await UploadAllPostMedia(sourcePost.Content.Rendered, targetPost.Id, sourcePost.Link);
 
                             var content = sourcePost.Content.Rendered;
                             content = ProcessShortcodes(content);
@@ -229,7 +229,7 @@ public partial class WpMigrator
                             }
                             else
                             {
-                                var uploaded = await UploadMedia(featuredUrl, attachToPostId: targetPost.Id);
+                                var uploaded = await UploadMedia(featuredUrl, attachToPostId: targetPost.Id, postLink: sourcePost.Link);
                                 if (uploaded != null)
                                     updates["featured_media"] = uploaded.Id;
                             }
@@ -282,7 +282,7 @@ public partial class WpMigrator
         content = ProcessShortcodes(content);
         content = CleanupHtml(content);
 
-        var uploadedMediaIds = await UploadAllPostMedia(sourcePost.Content.Rendered);
+        var uploadedMediaIds = await UploadAllPostMedia(sourcePost.Content.Rendered, postLink: sourcePost.Link);
         var authorId = ResolveTargetAuthorId(sourcePost.Author);
 
         // Rewrite source domain URLs to actual target media URLs
@@ -291,7 +291,7 @@ public partial class WpMigrator
         int? featuredMediaId = null;
         if (_backupFeaturedMediaUrls.TryGetValue(sourcePost.Slug, out var featuredUrl))
         {
-            var uploaded = await UploadMedia(featuredUrl);
+            var uploaded = await UploadMedia(featuredUrl, postLink: sourcePost.Link);
             if (uploaded != null) featuredMediaId = uploaded.Id;
         }
 
@@ -376,7 +376,7 @@ public partial class WpMigrator
             }
             else
             {
-                var uploaded = await UploadMedia(featuredUrl, attachToPostId: targetPost.Id);
+                var uploaded = await UploadMedia(featuredUrl, attachToPostId: targetPost.Id, postLink: sourcePost.Link);
                 if (uploaded != null)
                     updates["featured_media"] = uploaded.Id;
             }
@@ -385,7 +385,7 @@ public partial class WpMigrator
         // Check for missing inline media — upload first so URL mapping is populated
         var missingMedia = FindMissingMedia(sourcePost.Slug);
         if (missingMedia.Count > 0)
-            await UploadAllPostMedia(sourcePost.Content.Rendered, targetPost.Id);
+            await UploadAllPostMedia(sourcePost.Content.Rendered, targetPost.Id, sourcePost.Link);
 
         // Rewrite content URLs from source domain to actual target media URLs
         if (sourcePost.Content.Rendered.Contains(_config.SourceWpUrl))

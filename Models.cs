@@ -8,6 +8,7 @@ public class WpPost
 {
     [JsonProperty("id")] public int Id { get; set; }
     [JsonProperty("slug")] public string Slug { get; set; } = "";
+    [JsonProperty("link")] public string Link { get; set; } = "";
     [JsonProperty("date")] public DateTime Date { get; set; }
     [JsonProperty("modified")] public DateTime Modified { get; set; }
     [JsonProperty("status")] public string Status { get; set; } = "publish";

@@ -31,6 +31,14 @@ while (true)
     Console.ResetColor();
     Console.WriteLine("Fix content URLs + missing featured images (fast)");
     Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.Write("    relink   ");
+    Console.ResetColor();
+    Console.WriteLine("Fix internal post links with stale post-id suffixes");
+    Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.Write("    relink-test ");
+    Console.ResetColor();
+    Console.WriteLine("Dry-run relink on first 10 posts with hits (no push)");
+    Console.ForegroundColor = ConsoleColor.Cyan;
     Console.Write("    status   ");
     Console.ResetColor();
     Console.WriteLine("Compare source vs target, show progress");
@@ -64,6 +72,12 @@ while (true)
                 break;
             case "repair":
                 await migrator.Repair();
+                break;
+            case "relink":
+                await migrator.Relink();
+                break;
+            case "relink-test":
+                await migrator.Relink(dryRun: true, sampleLimit: 10);
                 break;
             case "status":
                 await migrator.Status();

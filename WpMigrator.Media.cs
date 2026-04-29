@@ -131,7 +131,7 @@ public partial class WpMigrator
     /// Does NOT modify content — URLs stay as source domain.
     /// Returns list of uploaded media IDs for post attachment.
     /// </summary>
-    private async Task<List<int>> UploadAllPostMedia(string content, int? attachToPostId = null)
+    private async Task<List<int>> UploadAllPostMedia(string content, int? attachToPostId = null, string? postLink = null)
     {
         var mediaUrls = ExtractMediaUrls(content).Where(IsSourceMedia).ToList();
         if (mediaUrls.Count == 0) return [];
@@ -141,7 +141,7 @@ public partial class WpMigrator
         await Parallel.ForEachAsync(mediaUrls, new ParallelOptions { MaxDegreeOfParallelism = 3 },
             async (url, _) =>
             {
-                var uploaded = await UploadMedia(url, attachToPostId);
+                var uploaded = await UploadMedia(url, attachToPostId, postLink);
                 if (uploaded != null)
                     uploadedIds.Add(uploaded.Id);
             });
@@ -173,7 +173,7 @@ public partial class WpMigrator
     }
 
     [SuppressMessage("ReSharper", "PossibleLossOfFraction")]
-    private async Task<MediaItem?> UploadMedia(string sourceUrl, int? attachToPostId = null)
+    private async Task<MediaItem?> UploadMedia(string sourceUrl, int? attachToPostId = null, string? postLink = null)
     {
         try
         {
@@ -208,7 +208,7 @@ public partial class WpMigrator
             var backupFile = FindInBackup(originalFileName) ?? FindInBackup(fileName);
             if (backupFile == null)
             {
-                _uploadErrors.Add($"{originalFileName}: not in backup");
+                _uploadErrors.Add($"{originalFileName}: not in backup{FormatPostLink(postLink)}");
                 return null;
             }
 
@@ -233,7 +233,7 @@ public partial class WpMigrator
 
             if (!response.IsSuccessStatusCode)
             {
-                _uploadErrors.Add($"{fileName}: HTTP {(int)response.StatusCode} — {Truncate(json, 200)}");
+                _uploadErrors.Add($"{fileName}: HTTP {(int)response.StatusCode} — {Truncate(json, 200)}{FormatPostLink(postLink)}");
                 return null;
             }
 
@@ -243,13 +243,16 @@ public partial class WpMigrator
         }
         catch (Exception ex)
         {
-            _uploadErrors.Add($"{sourceUrl}: {ex.Message}");
+            _uploadErrors.Add($"{sourceUrl}: {ex.Message}{FormatPostLink(postLink)}");
             return null;
         }
     }
 
     private static string Truncate(string s, int max) =>
         string.IsNullOrEmpty(s) ? "" : s.Length <= max ? s : s[..max] + "…";
+
+    private static string FormatPostLink(string? postLink) =>
+        string.IsNullOrEmpty(postLink) ? "" : $" (post: {postLink})";
 
     private async Task AttachMediaToPost(int mediaId, int postId)
     {

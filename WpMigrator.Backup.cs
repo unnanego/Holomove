@@ -106,7 +106,7 @@ public partial class WpMigrator
         if (distinctUrls.Count > 0)
         {
             await Parallel.ForEachAsync(distinctUrls, new ParallelOptions { MaxDegreeOfParallelism = 5 },
-                async (url, _) => await DownloadMediaToDisk(url, mediaFolder));
+                async (url, _) => await DownloadMediaToDisk(url, mediaFolder, post.Link));
         }
 
         CleanupBackupMedia(mediaFolder, distinctUrls);
@@ -130,7 +130,7 @@ public partial class WpMigrator
             Directory.Delete(mediaFolder);
     }
 
-    private async Task DownloadMediaToDisk(string sourceUrl, string targetFolder)
+    private async Task DownloadMediaToDisk(string sourceUrl, string targetFolder, string? postLink = null)
     {
         try
         {
@@ -145,7 +145,7 @@ public partial class WpMigrator
             using var response = await _httpClient.GetAsync(sourceUrl, HttpCompletionOption.ResponseHeadersRead);
             if (!response.IsSuccessStatusCode)
             {
-                _uploadErrors.Add($"{fileName}: backup download HTTP {(int)response.StatusCode} from {sourceUrl}");
+                _uploadErrors.Add($"{fileName}: backup download HTTP {(int)response.StatusCode} from {sourceUrl}{FormatPostLink(postLink)}");
                 return;
             }
 
@@ -155,7 +155,7 @@ public partial class WpMigrator
         }
         catch (Exception ex)
         {
-            _uploadErrors.Add($"{Path.GetFileName(new Uri(sourceUrl).LocalPath)}: backup download failed — {ex.Message}");
+            _uploadErrors.Add($"{Path.GetFileName(new Uri(sourceUrl).LocalPath)}: backup download failed — {ex.Message}{FormatPostLink(postLink)}");
             // Skip failed media downloads silently for backup
         }
     }
@@ -169,7 +169,7 @@ public partial class WpMigrator
         foreach (var slug in _backupFeaturedMediaUrls.Keys)
             slugsWithMedia.Add(slug);
 
-        var toDownload = new List<(string Url, string Folder)>();
+        var toDownload = new List<(string Url, string Folder, string PostLink)>();
         foreach (var slug in slugsWithMedia)
         {
             if (!postsBySlug.TryGetValue(slug, out var post)) continue;
@@ -185,7 +185,7 @@ public partial class WpMigrator
             {
                 var fileName = Path.GetFileName(new Uri(url).LocalPath);
                 if (!File.Exists(Path.Combine(mediaFolder, fileName)))
-                    toDownload.Add((url, mediaFolder));
+                    toDownload.Add((url, mediaFolder, post.Link));
             }
         }
 
@@ -195,7 +195,7 @@ public partial class WpMigrator
         await Parallel.ForEachAsync(toDownload, new ParallelOptions { MaxDegreeOfParallelism = 5 },
             async (item, _) =>
             {
-                await DownloadMediaToDisk(item.Url, item.Folder);
+                await DownloadMediaToDisk(item.Url, item.Folder, item.PostLink);
                 var fileName = Path.GetFileName(new Uri(item.Url).LocalPath);
                 if (File.Exists(Path.Combine(item.Folder, fileName)))
                     Interlocked.Increment(ref downloaded);
@@ -239,37 +239,53 @@ public partial class WpMigrator
 
         Console.Write($"  Loading {postFiles.Length} posts from backup...");
 
-        var loadedSlugs = _sourcePosts.Select(p => p.Slug).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var loadedSlugs = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in _sourcePosts) loadedSlugs.TryAdd(p.Slug, 0);
 
-        foreach (var file in postFiles)
+        var results = new System.Collections.Concurrent.ConcurrentBag<WpPost>();
+        var done = 0;
+        var errors = 0;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        Parallel.ForEach(postFiles, new ParallelOptions { MaxDegreeOfParallelism = 32 }, file =>
         {
             try
             {
                 var json = File.ReadAllText(file);
                 var backup = JsonConvert.DeserializeObject<BackupPost>(json);
-                if (backup == null) continue;
-
-                if (!string.IsNullOrEmpty(backup.FeaturedMediaUrl))
-                    _backupFeaturedMediaUrls[backup.Slug] = backup.FeaturedMediaUrl;
-                if (backup.MediaUrls.Count > 0)
-                    _backupMediaUrls[backup.Slug] = backup.MediaUrls;
-
-                if (!loadedSlugs.Add(backup.Slug)) continue;
-
-                _sourcePosts.Add(new WpPost
+                if (backup != null)
                 {
-                    Slug = backup.Slug,
-                    Date = backup.Date,
-                    Title = new WpRendered { Rendered = backup.Title },
-                    Content = new WpRendered { Rendered = backup.Content },
-                    Excerpt = new WpRendered { Rendered = backup.Excerpt },
-                    Status = backup.Status.ToLowerInvariant()
-                });
-            }
-            catch { /* skip corrupt files */ }
-        }
+                    if (!string.IsNullOrEmpty(backup.FeaturedMediaUrl))
+                        _backupFeaturedMediaUrls[backup.Slug] = backup.FeaturedMediaUrl;
+                    if (backup.MediaUrls.Count > 0)
+                        _backupMediaUrls[backup.Slug] = backup.MediaUrls;
 
-        Console.WriteLine($"\r  Loaded {_sourcePosts.Count} posts from backup.                    ");
+                    if (loadedSlugs.TryAdd(backup.Slug, 0))
+                    {
+                        results.Add(new WpPost
+                        {
+                            Slug = backup.Slug,
+                            Date = backup.Date,
+                            Title = new WpRendered { Rendered = backup.Title },
+                            Content = new WpRendered { Rendered = backup.Content },
+                            Excerpt = new WpRendered { Rendered = backup.Excerpt },
+                            Status = backup.Status.ToLowerInvariant()
+                        });
+                    }
+                }
+            }
+            catch { Interlocked.Increment(ref errors); }
+
+            var n = Interlocked.Increment(ref done);
+            if (n % 250 == 0 || n == postFiles.Length)
+            {
+                var rate = n / Math.Max(1, sw.Elapsed.TotalSeconds);
+                Console.Write($"\r  Loading backup: {n}/{postFiles.Length} ({rate:F0}/s, {errors} errors)        ");
+            }
+        });
+
+        _sourcePosts.AddRange(results);
+        Console.WriteLine($"\r  Loaded {_sourcePosts.Count} posts from backup ({errors} errors).                    ");
     }
 
     private async Task SaveTargetPostCache()
