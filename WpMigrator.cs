@@ -172,6 +172,37 @@ public partial class WpMigrator
             Console.WriteLine($"    - {err}");
     }
 
+    public async Task FindCyrillicSlugs()
+    {
+        Console.WriteLine("\n  Fetching source post slugs...");
+        var posts = await FetchAllPaginated<WpPost>(
+            _config.SourceWpApiUrl, "posts", useAuth: false, extraQuery: "_fields=id,slug,title,link");
+        Console.WriteLine($"  {posts.Count} source posts fetched.");
+
+        var cyrillic = new Regex(@"\p{IsCyrillic}");
+        var found = posts
+            .Where(p => !string.IsNullOrEmpty(p.Slug) &&
+                        cyrillic.IsMatch(Uri.UnescapeDataString(p.Slug)))
+            .OrderBy(p => p.Slug)
+            .ToList();
+
+        if (found.Count == 0)
+        {
+            Console.WriteLine("\n  No Cyrillic slugs found in source posts.");
+            return;
+        }
+
+        Console.WriteLine($"\n  {found.Count} source post(s) with Cyrillic slug:");
+        foreach (var p in found)
+        {
+            var decoded = Uri.UnescapeDataString(p.Slug);
+            var title = p.Title?.Rendered ?? "";
+            Console.WriteLine($"    {decoded}  —  {title}");
+            if (!string.IsNullOrEmpty(p.Link))
+                Console.WriteLine($"      {p.Link}");
+        }
+    }
+
     public async Task Status()
     {
         await FetchSourceData();

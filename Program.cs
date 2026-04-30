@@ -37,7 +37,11 @@ while (true)
     Console.ForegroundColor = ConsoleColor.Cyan;
     Console.Write("    relink-test ");
     Console.ResetColor();
-    Console.WriteLine("Dry-run relink on first 10 posts with hits (no push)");
+    Console.WriteLine("Dry-run relink on first 100 posts with hits (no push)");
+    Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.Write("    find-cyrillic ");
+    Console.ResetColor();
+    Console.WriteLine("List source posts with Cyrillic characters in slug");
     Console.ForegroundColor = ConsoleColor.Cyan;
     Console.Write("    status   ");
     Console.ResetColor();
@@ -77,7 +81,10 @@ while (true)
                 await migrator.Relink();
                 break;
             case "relink-test":
-                await migrator.Relink(dryRun: true, sampleLimit: 10);
+                await migrator.Relink(dryRun: true, sampleLimit: 100);
+                break;
+            case "find-cyrillic":
+                await migrator.FindCyrillicSlugs();
                 break;
             case "status":
                 await migrator.Status();

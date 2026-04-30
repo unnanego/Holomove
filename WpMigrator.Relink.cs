@@ -17,7 +17,7 @@ public partial class WpMigrator
 
         if (dryRun)
         {
-            Console.WriteLine($"\n  Dry-run: scanning until {sampleLimit} post(s) with internal-link hits found.\n");
+            Console.WriteLine($"\n  Dry-run: scanning until {sampleLimit} post(s) with unresolved links found.\n");
             var hits = 0;
             foreach (var kvp in contents)
             {
@@ -26,21 +26,15 @@ public partial class WpMigrator
                 if (string.IsNullOrEmpty(content)) continue;
 
                 var entries = ScanLinks(content, ctx);
-                if (entries.Count == 0) continue;
+                var unresolved = entries.Where(e => e.NewUrl == null).ToList();
+                if (unresolved.Count == 0) continue;
 
                 hits++;
                 var post = _targetPosts.FirstOrDefault(p => p.Id == kvp.Key);
-                var pLink = post?.Link ?? kvp.Value.Link;
-                var pSlug = post?.Slug ?? kvp.Key.ToString();
+                var pLink = StripStagingHost(post?.Link ?? kvp.Value.Link);
                 Console.WriteLine($"  [{hits}] {pLink}");
-                Console.WriteLine($"      slug: {pSlug}");
-                foreach (var e in entries)
-                {
-                    if (e.NewUrl != null)
-                        Console.WriteLine($"      FIX:    {e.OldUrl}\n           -> {e.NewUrl}");
-                    else
-                        Console.WriteLine($"      {e.Status.ToUpper()}: {e.OldUrl}");
-                }
+                foreach (var e in unresolved)
+                    Console.WriteLine($"      {e.Status.ToUpper()}: {e.OldUrl}");
                 Console.WriteLine();
             }
 
@@ -215,6 +209,7 @@ public partial class WpMigrator
             if (!host.Equals(ctx.SourceHost, StringComparison.OrdinalIgnoreCase) &&
                 !host.Equals(ctx.TargetHost, StringComparison.OrdinalIgnoreCase)) continue;
             var path = uri.AbsolutePath.TrimEnd('/');
+            if (IsArchivePath(path)) continue;
             var lastSlash = path.LastIndexOf('/');
             if (lastSlash < 0) continue;
             var linkSlug = path[(lastSlash + 1)..];
@@ -233,13 +228,17 @@ public partial class WpMigrator
             if (ctx.StemGroups.TryGetValue(stem, out var byStem))
                 foreach (var p in byStem) candidates.Add(p);
 
-            // Number match (≥3-digit only): same id, normalized stem (dash-collapsed) equal.
+            // Number match (≥3-digit only): same post-id, stems related by:
+            //   - normalized equality (dash-shift / typo)
+            //   - whole-word prefix in either direction (rename added or removed trailing words)
             if (num.Length >= 3 && ctx.NumGroups.TryGetValue(num, out var byNum))
                 foreach (var p in byNum)
                 {
                     var tm = ctx.StemRegex.Match(p.Slug);
                     if (!tm.Success) continue;
-                    if (NormalizeStem(tm.Groups[1].Value).Equals(stemNorm, StringComparison.OrdinalIgnoreCase))
+                    var pStem = tm.Groups[1].Value;
+                    if (NormalizeStem(pStem).Equals(stemNorm, StringComparison.OrdinalIgnoreCase) ||
+                        IsWordPrefix(stem, pStem) || IsWordPrefix(pStem, stem))
                         candidates.Add(p);
                 }
 
@@ -257,13 +256,31 @@ public partial class WpMigrator
             var newUrl = !string.IsNullOrEmpty(match.Link)
                 ? match.Link
                 : $"{_config.TargetWpUrl}/{match.Slug}/";
-            result.Add((url, newUrl, "fix"));
+            result.Add((url, StripStagingHost(newUrl), "fix"));
         }
         return result;
     }
 
     private static string NormalizeStem(string s) =>
         new string(s.Where(char.IsLetterOrDigit).ToArray()).ToLowerInvariant();
+
+    private static bool IsWordPrefix(string shorter, string longer) =>
+        longer.Length > shorter.Length &&
+        longer.StartsWith(shorter + "-", StringComparison.OrdinalIgnoreCase);
+
+    private static string StripStagingHost(string url) =>
+        string.IsNullOrEmpty(url) ? url : Regex.Replace(url, @"://new\.", "://", RegexOptions.IgnoreCase);
+
+    private static readonly string[] ArchivePrefixes =
+        ["tag", "category", "author", "page", "feed", "wp-content", "wp-admin", "wp-json", "comments"];
+
+    private static bool IsArchivePath(string path)
+    {
+        var trimmed = path.TrimStart('/');
+        var firstSlash = trimmed.IndexOf('/');
+        var firstSegment = firstSlash < 0 ? trimmed : trimmed[..firstSlash];
+        return ArchivePrefixes.Contains(firstSegment, StringComparer.OrdinalIgnoreCase);
+    }
 
     private static string NormalizeHost(string host)
     {
