@@ -43,6 +43,10 @@ while (true)
     Console.ResetColor();
     Console.WriteLine("List source posts with Cyrillic characters in slug");
     Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.Write("    find-extras ");
+    Console.ResetColor();
+    Console.WriteLine("List target posts with no source counterpart");
+    Console.ForegroundColor = ConsoleColor.Cyan;
     Console.Write("    status   ");
     Console.ResetColor();
     Console.WriteLine("Compare source vs target, show progress");
@@ -85,6 +89,9 @@ while (true)
                 break;
             case "find-cyrillic":
                 await migrator.FindCyrillicSlugs();
+                break;
+            case "find-extras":
+                await migrator.FindExtraTargets();
                 break;
             case "status":
                 await migrator.Status();

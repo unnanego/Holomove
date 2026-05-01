@@ -203,6 +203,57 @@ public partial class WpMigrator
         }
     }
 
+    public async Task FindExtraTargets()
+    {
+        Console.WriteLine("\n  Fetching source posts...");
+        var sourcePosts = await FetchAllPaginated<WpPost>(
+            _config.SourceWpApiUrl, "posts", useAuth: false, extraQuery: "_fields=id,slug,date,link");
+        var sourceSlugs = sourcePosts.Select(p => p.Slug).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        Console.WriteLine($"  {sourcePosts.Count} source posts.");
+
+        Console.WriteLine("  Fetching target posts...");
+        var targetPosts = await FetchAllPaginated<WpPost>(
+            _config.TargetWpApiUrl, "posts", useAuth: true, extraQuery: "_fields=id,slug,date,status,link");
+        Console.WriteLine($"  {targetPosts.Count} target posts.");
+
+        // Map each target to its "claimed" source slug (exact, or stripped of -N collision suffix).
+        var stripSuffix = new Regex(@"-(\d{1,2})$");
+        string? ClaimedSourceSlug(string targetSlug)
+        {
+            if (sourceSlugs.Contains(targetSlug)) return targetSlug;
+            var m = stripSuffix.Match(targetSlug);
+            if (!m.Success) return null;
+            if (!int.TryParse(m.Groups[1].Value, out var n) || n < 2 || n > 19) return null;
+            var stripped = targetSlug[..m.Index];
+            return sourceSlugs.Contains(stripped) ? stripped : null;
+        }
+
+        var unclaimed = new List<WpPost>();
+        var byClaim = new Dictionary<string, List<WpPost>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in targetPosts)
+        {
+            var claim = ClaimedSourceSlug(p.Slug);
+            if (claim == null) { unclaimed.Add(p); continue; }
+            if (!byClaim.TryGetValue(claim, out var list)) byClaim[claim] = list = [];
+            list.Add(p);
+        }
+
+        var multiClaim = byClaim.Where(kv => kv.Value.Count > 1).OrderBy(kv => kv.Key).ToList();
+
+        Console.WriteLine($"\n  Source: {sourcePosts.Count}, Target: {targetPosts.Count}, diff: {targetPosts.Count - sourcePosts.Count}");
+        Console.WriteLine($"  Unclaimed targets (no source counterpart): {unclaimed.Count}");
+        foreach (var p in unclaimed.OrderBy(p => p.Date))
+            Console.WriteLine($"    id={p.Id}  {p.Date:yyyy-MM-dd}  {p.Slug}  {p.Link}");
+
+        Console.WriteLine($"\n  Source slugs claimed by multiple targets: {multiClaim.Count}");
+        foreach (var (sourceSlug, group) in multiClaim)
+        {
+            Console.WriteLine($"    source: {sourceSlug}");
+            foreach (var p in group.OrderBy(p => p.Date))
+                Console.WriteLine($"      id={p.Id}  {p.Date:yyyy-MM-dd}  {p.Slug}  {p.Link}");
+        }
+    }
+
     public async Task Status()
     {
         await FetchSourceData();

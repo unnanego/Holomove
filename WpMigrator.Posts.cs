@@ -26,7 +26,46 @@ public partial class WpMigrator
             fields: "id,slug,link,date,modified,status,title,content,excerpt,author,featured_media,tags,categories,meta");
         Console.WriteLine($"  Source: {_sourcePosts.Count} posts loaded");
 
+        RemoveOrphanBackupPosts();
+
         await BuildSourceMediaIndex();
+    }
+
+    /// <summary>
+    /// After live merge, any _sourcePosts entry still at Id==0 is a stub from backup
+    /// with no live counterpart — slug renamed or deleted upstream. Remove from
+    /// in-memory list and delete its backup folder so it doesn't get re-synced as
+    /// a ghost post on target.
+    /// </summary>
+    private void RemoveOrphanBackupPosts()
+    {
+        var orphans = _sourcePosts.Where(p => p.Id == 0).ToList();
+        if (orphans.Count == 0) return;
+
+        Console.WriteLine($"  Cleaning {orphans.Count} orphan backup post(s) (slug renamed or deleted upstream):");
+        foreach (var orphan in orphans)
+        {
+            var folder = GetPostBackupFolder(orphan);
+            try
+            {
+                if (Directory.Exists(folder))
+                {
+                    Directory.Delete(folder, recursive: true);
+                    Console.WriteLine($"    removed: {orphan.Slug}");
+                }
+                else
+                {
+                    Console.WriteLine($"    skipped (no folder): {orphan.Slug}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"    failed: {orphan.Slug} — {ex.Message}");
+            }
+            _sourcePosts.Remove(orphan);
+            _backupFeaturedMediaUrls.TryRemove(orphan.Slug, out _);
+            _backupMediaUrls.TryRemove(orphan.Slug, out _);
+        }
     }
 
     private async Task FetchTargetData()
@@ -137,8 +176,14 @@ public partial class WpMigrator
             {
                 try
                 {
+                    // Defense-in-depth: stub posts (Id==0) shouldn't reach here after
+                    // RemoveOrphanBackupPosts, but skip just in case to avoid ghost creation.
+                    if (sourcePost.Id == 0)
+                    {
+                        Interlocked.Increment(ref skipped);
+                    }
                     // Skip posts already verified as fully synced
-                    if (_verifiedPosts.ContainsKey(sourcePost.Slug))
+                    else if (_verifiedPosts.ContainsKey(sourcePost.Slug))
                     {
                         Interlocked.Increment(ref verified);
                     }
