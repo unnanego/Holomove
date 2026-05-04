@@ -26,6 +26,16 @@ public partial class WpMigrator
         var parser = new HtmlParser();
         var doc = parser.ParseDocument($"<body>{content}</body>");
 
+        // Strip srcset/sizes from <img> tags. WP only auto-injects responsive
+        // attributes when missing, so leaving source's pre-baked srcset means
+        // target keeps source-host URLs and can't pick up target's actual sizes.
+        // Letting target's wp_filter_content_tags rebuild on render = always correct.
+        foreach (var img in doc.QuerySelectorAll("img[srcset], img[sizes]"))
+        {
+            img.RemoveAttribute("srcset");
+            img.RemoveAttribute("sizes");
+        }
+
         // Clean up TablePress tables
         foreach (var table in doc.QuerySelectorAll("table.tablepress"))
         {

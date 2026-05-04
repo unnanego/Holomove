@@ -189,6 +189,10 @@ public partial class WpMigrator
 
             var targetUrl = sourceUrl.Replace(_config.SourceWpUrl, _config.TargetWpUrl);
 
+            // Size variants (photo-300x200.jpg) aren't separate media library records —
+            // WP regenerates them from the base file on demand. Match against the base.
+            var (baseOriginal, baseSanitized) = StripSizeSuffix(originalFileName, fileName);
+
             MediaItem? existingMedia = null;
             if (_targetMediaByUrl.TryGetValue(targetUrl, out var byUrl))
                 existingMedia = byUrl;
@@ -196,6 +200,12 @@ public partial class WpMigrator
                 existingMedia = byFilename;
             else if (_targetMediaByFilename.TryGetValue(fileName, out var bySanitizedFilename))
                 existingMedia = bySanitizedFilename;
+            else if (baseOriginal != originalFileName &&
+                     _targetMediaByFilename.TryGetValue(baseOriginal, out var byBase))
+                existingMedia = byBase;
+            else if (baseSanitized != fileName &&
+                     _targetMediaByFilename.TryGetValue(baseSanitized, out var byBaseSanitized))
+                existingMedia = byBaseSanitized;
 
             if (existingMedia != null)
             {
@@ -204,13 +214,27 @@ public partial class WpMigrator
                 return existingMedia;
             }
 
-            // Only upload from backup — never directly from source
-            var backupFile = FindInBackup(originalFileName) ?? FindInBackup(fileName);
+            // For size variants, upload the BASE file instead of the variant —
+            // WP regenerates variants on demand from the base. Uploading the
+            // variant directly would create a separate media record that can't
+            // generate further size variants properly.
+            string lookupOriginal = originalFileName;
+            string lookupSanitized = fileName;
+            if (baseOriginal != originalFileName)
+            {
+                lookupOriginal = baseOriginal;
+                lookupSanitized = baseSanitized;
+            }
+
+            var backupFile = FindInBackup(lookupOriginal) ?? FindInBackup(lookupSanitized);
             if (backupFile == null)
             {
-                _uploadErrors.Add($"{originalFileName}: not in backup{FormatPostLink(postLink)}");
+                _uploadErrors.Add($"{lookupOriginal}: not in backup{FormatPostLink(postLink)}");
                 return null;
             }
+            // Use the base name for the upload so WP stores it canonically.
+            originalFileName = lookupOriginal;
+            fileName = lookupSanitized;
 
             var mediaBytes = await File.ReadAllBytesAsync(backupFile);
 
@@ -228,7 +252,7 @@ public partial class WpMigrator
             };
             request.Content = uploadContent;
 
-            var response = await _httpClient.SendAsync(request);
+            var response = await SendWriteAsync(() => _httpClient.SendAsync(request));
             var json = await response.Content.ReadAsStringAsync();
 
             if (!response.IsSuccessStatusCode)
@@ -292,12 +316,30 @@ public partial class WpMigrator
                 var fileName = Path.GetFileName(new Uri(url).LocalPath);
                 var sanitized = NonAsciiRegex().Replace(fileName, "");
                 var targetUrl = url.Replace(_config.SourceWpUrl, _config.TargetWpUrl);
+                var (baseOriginal, baseSanitized) = StripSizeSuffix(fileName, sanitized);
 
                 return !_targetMediaByUrl.ContainsKey(targetUrl) &&
                        !_targetMediaByFilename.ContainsKey(fileName) &&
-                       !_targetMediaByFilename.ContainsKey(sanitized);
+                       !_targetMediaByFilename.ContainsKey(sanitized) &&
+                       !_targetMediaByFilename.ContainsKey(baseOriginal) &&
+                       !_targetMediaByFilename.ContainsKey(baseSanitized);
             })
             .ToList();
+    }
+
+    private static readonly Regex SizeSuffixRegex = new(@"^(.+)-\d+x\d+(\.[^.]+)$", RegexOptions.Compiled);
+
+    private static (string OriginalBase, string SanitizedBase) StripSizeSuffix(string original, string sanitized)
+    {
+        var origBase = original;
+        var origMatch = SizeSuffixRegex.Match(original);
+        if (origMatch.Success) origBase = origMatch.Groups[1].Value + origMatch.Groups[2].Value;
+
+        var sanBase = sanitized;
+        var sanMatch = SizeSuffixRegex.Match(sanitized);
+        if (sanMatch.Success) sanBase = sanMatch.Groups[1].Value + sanMatch.Groups[2].Value;
+
+        return (origBase, sanBase);
     }
 
     [GeneratedRegex(@"[^\u0000-\u007F]+")]

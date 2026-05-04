@@ -4,7 +4,7 @@ namespace Holomove;
 
 public partial class WpMigrator
 {
-    public async Task Relink(bool dryRun = false, int sampleLimit = 10)
+    public async Task Relink()
     {
         await FetchTargetData();
         BuildLookupDictionaries();
@@ -15,30 +15,61 @@ public partial class WpMigrator
 
         var ctx = BuildResolverContext();
 
-        if (dryRun)
+        // Pre-pass: scan all posts, count fixes/unresolved, collect samples.
+        Console.WriteLine("\n  Scanning for stale internal post-id links...");
+        var totalFixes = 0;
+        var totalUnresolved = 0;
+        var postsWithFixes = 0;
+        var unresolvedSamples = new List<(string Link, List<(string OldUrl, string Status)> Issues)>();
+        const int sampleLimit = 10;
+
+        foreach (var kvp in contents)
         {
-            Console.WriteLine($"\n  Dry-run: scanning until {sampleLimit} post(s) with unresolved links found.\n");
-            var hits = 0;
-            foreach (var kvp in contents)
+            var content = kvp.Value.Content;
+            if (string.IsNullOrEmpty(content)) continue;
+
+            var entries = ScanLinks(content, ctx);
+            if (entries.Count == 0) continue;
+
+            var fixesThisPost = entries.Count(e => e.NewUrl != null);
+            var unresolvedThisPost = entries.Where(e => e.NewUrl == null).ToList();
+            if (fixesThisPost > 0) postsWithFixes++;
+            totalFixes += fixesThisPost;
+            totalUnresolved += unresolvedThisPost.Count;
+
+            if (unresolvedSamples.Count < sampleLimit && unresolvedThisPost.Count > 0)
             {
-                if (hits >= sampleLimit) break;
-                var content = kvp.Value.Content;
-                if (string.IsNullOrEmpty(content)) continue;
-
-                var entries = ScanLinks(content, ctx);
-                var unresolved = entries.Where(e => e.NewUrl == null).ToList();
-                if (unresolved.Count == 0) continue;
-
-                hits++;
                 var post = _targetPosts.FirstOrDefault(p => p.Id == kvp.Key);
-                var pLink = StripStagingHost(post?.Link ?? kvp.Value.Link);
-                Console.WriteLine($"  [{hits}] {pLink}");
-                foreach (var e in unresolved)
-                    Console.WriteLine($"      {e.Status.ToUpper()}: {e.OldUrl}");
-                Console.WriteLine();
+                var link = StripStagingHost(post?.Link ?? kvp.Value.Link);
+                unresolvedSamples.Add((link, unresolvedThisPost.Select(e => (e.OldUrl, e.Status)).ToList()));
             }
+        }
 
-            Console.WriteLine($"  Done. {hits} post(s) shown. (No changes pushed.)");
+        Console.WriteLine($"\n  Resolvable: {totalFixes} link(s) across {postsWithFixes} post(s)");
+        Console.WriteLine($"  Unresolved (won't be touched): {totalUnresolved}");
+
+        if (unresolvedSamples.Count > 0)
+        {
+            Console.WriteLine($"\n  First {unresolvedSamples.Count} post(s) with unresolved links:");
+            foreach (var (link, issues) in unresolvedSamples)
+            {
+                Console.WriteLine($"    {link}");
+                foreach (var (url, status) in issues)
+                    Console.WriteLine($"      {status.ToUpper()}: {url}");
+            }
+        }
+
+        if (totalFixes == 0)
+        {
+            Console.WriteLine("\n  Nothing to apply.");
+            return;
+        }
+
+        Console.Write("\n  Apply replacements? [y/N]: ");
+        var input = Console.ReadLine()?.Trim().ToLowerInvariant();
+        if (input != "y" && input != "yes")
+        {
+            Console.WriteLine("  Aborted.");
             return;
         }
 

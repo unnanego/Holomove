@@ -61,6 +61,25 @@ public class MediaItem
 {
     [JsonProperty("id")] public int Id { get; set; }
     [JsonProperty("source_url")] public string SourceUrl { get; set; } = "";
+    [JsonProperty("post")] public int Post { get; set; }
+    [JsonProperty("media_details")] public MediaDetails? MediaDetails { get; set; }
+}
+
+public class MediaDetails
+{
+    [JsonProperty("file")] public string? File { get; set; }
+    [JsonProperty("filesize")] public long? FileSize { get; set; }
+    [JsonProperty("width")] public int? Width { get; set; }
+    [JsonProperty("height")] public int? Height { get; set; }
+    [JsonProperty("sizes")] public Dictionary<string, MediaSize>? Sizes { get; set; }
+}
+
+public class MediaSize
+{
+    [JsonProperty("file")] public string? File { get; set; }
+    [JsonProperty("source_url")] public string? SourceUrl { get; set; }
+    [JsonProperty("width")] public int? Width { get; set; }
+    [JsonProperty("height")] public int? Height { get; set; }
 }
 
 // Human-readable backup models

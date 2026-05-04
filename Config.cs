@@ -6,6 +6,7 @@ public class SiteConfig
 {
     public string SourceDomain { get; set; } = "";
     public string TargetDomain { get; set; } = "";
+    public string CanonicalDomain { get; set; } = "";
     public string TargetUsername { get; set; } = "";
     public string TargetPassword { get; set; } = "";
     public string BackupPath { get; set; } = "backup";
@@ -16,6 +17,15 @@ public class SiteConfig
     [JsonIgnore] public string TargetWpApiUrl => $"{TargetWpUrl}/wp-json/";
 
     [JsonIgnore] public bool IsConfigured => !string.IsNullOrEmpty(SourceDomain) && !string.IsNullOrEmpty(TargetDomain);
+
+    private static string StripStagingPrefix(string domain)
+    {
+        if (string.IsNullOrEmpty(domain)) return domain;
+        foreach (var prefix in new[] { "new.", "staging.", "stage.", "dev.", "test." })
+            if (domain.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                return domain[prefix.Length..];
+        return domain;
+    }
 
     private const string SettingsFile = "settings.json";
 
@@ -46,6 +56,15 @@ public class SiteConfig
         Console.Write($"  Target domain [{config.TargetDomain}]: ");
         input = Console.ReadLine()?.Trim();
         if (!string.IsNullOrEmpty(input)) config.TargetDomain = input.Replace("https://", "").Replace("http://", "").TrimEnd('/');
+
+        var canonicalDefault = string.IsNullOrEmpty(config.CanonicalDomain)
+            ? StripStagingPrefix(config.TargetDomain)
+            : config.CanonicalDomain;
+        Console.Write($"  Canonical domain (for finalize) [{canonicalDefault}]: ");
+        input = Console.ReadLine()?.Trim();
+        config.CanonicalDomain = !string.IsNullOrEmpty(input)
+            ? input.Replace("https://", "").Replace("http://", "").TrimEnd('/')
+            : canonicalDefault;
 
         Console.Write($"  Target username [{config.TargetUsername}]: ");
         input = Console.ReadLine()?.Trim();

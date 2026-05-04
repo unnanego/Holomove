@@ -43,6 +43,14 @@ public partial class WpMigrator
     // Serialize re-auth on 401
     private readonly SemaphoreSlim _authLock = new(1, 1);
 
+    // Global write throttle. WP REST POST triggers full save_post lifecycle
+    // (RankMath sitemap regen, schema rebuild, revisions, plugin hooks) which
+    // pile up under parallel load. Cap concurrency at 1 with a small spacing
+    // delay so callers can stay parallel for fetches but writes serialize.
+    private readonly SemaphoreSlim _writeSemaphore = new(1, 1);
+    private long _lastWriteTicks;
+    private const int MinWriteSpacingMs = 150;
+
     // Backup media data (slug -> URLs) — written in parallel during SavePostToBackup
     private readonly ConcurrentDictionary<string, string> _backupFeaturedMediaUrls = new();
     private readonly ConcurrentDictionary<string, List<string>> _backupMediaUrls = new();
@@ -273,9 +281,35 @@ public partial class WpMigrator
 
     private async Task<HttpResponseMessage> PostJsonAsync(string url, object payload)
     {
-        var request = CreateAuthenticatedRequest(HttpMethod.Post, url);
-        request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
-        return await _httpClient.SendAsync(request);
+        return await SendWriteAsync(() =>
+        {
+            var request = CreateAuthenticatedRequest(HttpMethod.Post, url);
+            request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
+            return _httpClient.SendAsync(request);
+        });
+    }
+
+    /// <summary>
+    /// Funnels every write (POST/PUT/PATCH/DELETE/multipart upload) through a
+    /// single semaphore + spacing delay so concurrent callers can't pile up
+    /// save_post hooks on the WP server.
+    /// </summary>
+    private async Task<HttpResponseMessage> SendWriteAsync(Func<Task<HttpResponseMessage>> sendFunc)
+    {
+        await _writeSemaphore.WaitAsync();
+        try
+        {
+            var prev = Interlocked.Read(ref _lastWriteTicks);
+            var elapsedMs = (DateTime.UtcNow.Ticks - prev) / TimeSpan.TicksPerMillisecond;
+            if (elapsedMs < MinWriteSpacingMs)
+                await Task.Delay((int)(MinWriteSpacingMs - elapsedMs));
+            Interlocked.Exchange(ref _lastWriteTicks, DateTime.UtcNow.Ticks);
+            return await sendFunc();
+        }
+        finally
+        {
+            _writeSemaphore.Release();
+        }
     }
 
     /// <summary>
@@ -380,8 +414,9 @@ public partial class WpMigrator
     {
         if (string.IsNullOrEmpty(content)) return content;
 
-        // Match all source-domain media URLs (covers src, srcset, href, etc.)
-        var pattern = Regex.Escape(_config.SourceWpUrl) + @"/wp-content/uploads/[^\s""'<>\)]+";
+        // Match source-domain media URLs across both http and https (legacy posts may
+        // still embed http URLs even when current site is https-only).
+        var pattern = @"https?://" + Regex.Escape(_config.SourceDomain) + @"/wp-content/uploads/[^\s""'<>\)]+";
 
         return Regex.Replace(content, pattern, match =>
         {

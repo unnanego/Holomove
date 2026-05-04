@@ -17,47 +17,28 @@ if (!config.IsConfigured)
 var migrator = new WpMigrator(config);
 await migrator.Init();
 
+void PrintCommand(string name, string desc)
+{
+    Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.Write($"    {name,-14}");
+    Console.ResetColor();
+    Console.WriteLine(desc);
+}
+
 while (true)
 {
     Console.WriteLine();
     Console.ForegroundColor = ConsoleColor.DarkGray;
     Console.WriteLine("  Commands:");
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    migrate  ");
-    Console.ResetColor();
-    Console.WriteLine("Sync source → backup → target (idempotent)");
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    repair   ");
-    Console.ResetColor();
-    Console.WriteLine("Fix content URLs + missing featured images (fast)");
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    relink   ");
-    Console.ResetColor();
-    Console.WriteLine("Fix internal post links with stale post-id suffixes");
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    relink-test ");
-    Console.ResetColor();
-    Console.WriteLine("Dry-run relink on first 100 posts with hits (no push)");
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    find-cyrillic ");
-    Console.ResetColor();
-    Console.WriteLine("List source posts with Cyrillic characters in slug");
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    find-extras ");
-    Console.ResetColor();
-    Console.WriteLine("List target posts with no source counterpart");
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    status   ");
-    Console.ResetColor();
-    Console.WriteLine("Compare source vs target, show progress");
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    setup    ");
-    Console.ResetColor();
-    Console.WriteLine("Configure source/target WordPress sites");
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("    exit     ");
-    Console.ResetColor();
-    Console.WriteLine("Exit the application");
+    PrintCommand("migrate",      "Sync source → backup → target (idempotent)");
+    PrintCommand("audit",        "Diagnostics: cyrillic slugs + extra posts + broken media");
+    PrintCommand("fix-content",  "Strip srcset, repair broken URLs, rewrite size variants");
+    PrintCommand("relink",       "Fix internal post links with stale post-id suffixes");
+    PrintCommand("dedupe-media", "Merge duplicate media uploads");
+    PrintCommand("finalize",     "Rewrite media URLs from target domain to canonical");
+    PrintCommand("status",       "Compare source vs target, show progress");
+    PrintCommand("setup",        "Configure source/target WordPress sites");
+    PrintCommand("exit",         "Exit the application");
     Console.WriteLine();
 
     Console.Write("  > ");
@@ -78,20 +59,20 @@ while (true)
             case "migrate":
                 await migrator.Migrate();
                 break;
-            case "repair":
-                await migrator.Repair();
+            case "audit":
+                await migrator.RunAudit();
+                break;
+            case "fix-content":
+                await migrator.FixContent();
                 break;
             case "relink":
                 await migrator.Relink();
                 break;
-            case "relink-test":
-                await migrator.Relink(dryRun: true, sampleLimit: 100);
+            case "dedupe-media":
+                await migrator.DedupeMedia();
                 break;
-            case "find-cyrillic":
-                await migrator.FindCyrillicSlugs();
-                break;
-            case "find-extras":
-                await migrator.FindExtraTargets();
+            case "finalize":
+                await migrator.FinalizeUrls();
                 break;
             case "status":
                 await migrator.Status();

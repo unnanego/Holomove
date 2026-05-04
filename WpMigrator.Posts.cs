@@ -189,15 +189,17 @@ public partial class WpMigrator
                     }
                     else if (FindTargetForSource(sourcePost, targetPostsBySlug) is { } targetPost)
                     {
-                        if (await UpdatePostIfNeeded(sourcePost, targetPost))
+                        var (changed, fullyResolved) = await UpdatePostIfNeeded(sourcePost, targetPost);
+                        if (changed)
                             Interlocked.Increment(ref updated);
                         else
                             Interlocked.Increment(ref skipped);
 
-                        // Mark verified after any successful examine — next run skips.
-                        // Content rewrite always reports "changed" vs raw source, so without this
-                        // we'd re-push content for every post on every run.
-                        _verifiedPosts[sourcePost.Slug] = true;
+                        // Mark verified only when content has no unresolved source URLs.
+                        // Otherwise the post will be re-examined next run, giving a chance
+                        // to retry uploads / rewrites once media becomes available.
+                        if (fullyResolved)
+                            _verifiedPosts[sourcePost.Slug] = true;
                     }
                     else
                     {
@@ -205,7 +207,10 @@ public partial class WpMigrator
                         if (newPost != null)
                         {
                             lock (postLock) { _targetPosts.Add(newPost); }
-                            _verifiedPosts[sourcePost.Slug] = true;
+                            // CreatePostOnTarget rewrites URLs in-flight; only verify if
+                            // the content it sent has no source URLs left.
+                            if (!HasUnresolvedSourceMedia(newPost.Content.Rendered))
+                                _verifiedPosts[sourcePost.Slug] = true;
                         }
                         Interlocked.Increment(ref created);
                     }
@@ -379,9 +384,10 @@ public partial class WpMigrator
         return createdPost;
     }
 
-    private async Task<bool> UpdatePostIfNeeded(WpPost sourcePost, WpPost targetPost)
+    private async Task<(bool Changed, bool FullyResolved)> UpdatePostIfNeeded(WpPost sourcePost, WpPost targetPost)
     {
         var updates = new Dictionary<string, object>();
+        var fullyResolved = true;
 
         var expectedAuthorId = ResolveTargetAuthorId(sourcePost.Author);
         if (targetPost.Author != expectedAuthorId)
@@ -433,25 +439,47 @@ public partial class WpMigrator
             await UploadAllPostMedia(sourcePost.Content.Rendered, targetPost.Id, sourcePost.Link);
 
         // Rewrite content URLs from source domain to actual target media URLs
-        if (sourcePost.Content.Rendered.Contains(_config.SourceWpUrl))
+        if (HasSourceContentUrls(sourcePost.Content.Rendered))
         {
             var content = sourcePost.Content.Rendered;
             content = ProcessShortcodes(content);
             content = CleanupHtml(content);
             var rewritten = RewriteContentUrls(content);
-            // Only push the update if URLs actually changed
             if (rewritten != content)
                 updates["content"] = rewritten;
+            if (HasUnresolvedSourceMedia(rewritten))
+                fullyResolved = false;
         }
 
-        if (updates.Count == 0 && missingMedia.Count == 0) return false;
+        if (updates.Count == 0 && missingMedia.Count == 0) return (false, fullyResolved);
 
         Console.WriteLine($"\n    Updating {sourcePost.Slug}: {string.Join(", ", updates.Keys)}{(missingMedia.Count > 0 ? $", {missingMedia.Count} missing media" : "")}");
 
         if (updates.Count > 0)
             await PostJsonAsync($"{_config.TargetWpApiUrl}wp/v2/posts/{targetPost.Id}", updates);
-        return true;
+        return (true, fullyResolved);
     }
+
+    /// <summary>
+    /// Protocol-agnostic check: does this content contain any source-domain WP URL?
+    /// </summary>
+    private bool HasSourceContentUrls(string content) =>
+        !string.IsNullOrEmpty(content) &&
+        System.Text.RegularExpressions.Regex.IsMatch(
+            content,
+            @"https?://" + System.Text.RegularExpressions.Regex.Escape(_config.SourceDomain) + @"/wp-content",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// True if content still has source-domain media URLs after rewrite — means
+    /// some media wasn't found in target library and target images will 404.
+    /// </summary>
+    private bool HasUnresolvedSourceMedia(string content) =>
+        !string.IsNullOrEmpty(content) &&
+        System.Text.RegularExpressions.Regex.IsMatch(
+            content,
+            @"https?://" + System.Text.RegularExpressions.Regex.Escape(_config.SourceDomain) + @"/wp-content/uploads",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
     private int ResolveTargetAuthorId(int sourceAuthorId)
     {
@@ -504,8 +532,8 @@ public partial class WpMigrator
             try
             {
                 var url = $"{_config.TargetWpApiUrl}wp/v2/posts/{post.Id}?force=true";
-                var request = CreateAuthenticatedRequest(HttpMethod.Delete, url);
-                var response = await _httpClient.SendAsync(request);
+                var response = await SendWriteAsync(() =>
+                    _httpClient.SendAsync(CreateAuthenticatedRequest(HttpMethod.Delete, url)));
                 if (response.IsSuccessStatusCode) _targetPosts.RemoveAll(p => p.Id == post.Id);
             }
             catch { /* skip */ }
