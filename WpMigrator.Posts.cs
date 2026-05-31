@@ -22,8 +22,11 @@ public partial class WpMigrator
         Console.WriteLine($"\r  Source: {_sourceAuthors.Count} authors, {_sourceTags.Count} tags, {_sourceCategories.Count} categories");
 
         Console.WriteLine($"  {_sourcePosts.Count} posts from backup, fetching updates...");
+        // Dropped `meta` from bulk fetch — custom-fields-api.php returns ALL post_meta
+        // per item via get_post_meta(), which is heavy on a large site. Meta is only
+        // needed when CREATING a new target post; lazy-fetch there via GetPostMeta().
         await FetchPostsInBulk(_config.SourceWpApiUrl, _sourcePosts, useAuth: false,
-            fields: "id,slug,link,date,modified,status,title,content,excerpt,author,featured_media,tags,categories,meta");
+            fields: "id,slug,link,date,modified,status,title,content,excerpt,author,featured_media,tags,categories");
         Console.WriteLine($"  Source: {_sourcePosts.Count} posts loaded");
 
         RemoveOrphanBackupPosts();
@@ -157,11 +160,11 @@ public partial class WpMigrator
         return null;
     }
 
-    private async Task SyncAllPosts()
+    private async Task SyncAllPosts(Dictionary<string, string>? targetContentsBySlug = null)
     {
         Console.WriteLine("\n  Syncing posts...");
 
-        var targetPostsBySlug = _targetPosts.ToDictionary(p => p.Slug, p => p);
+        var targetPostsBySlug = BuildBySlug(_targetPosts, p => p.Slug, "target posts");
         var created = 0;
         var updated = 0;
         var skipped = 0;
@@ -182,48 +185,99 @@ public partial class WpMigrator
                     {
                         Interlocked.Increment(ref skipped);
                     }
-                    // Skip posts already verified as fully synced
-                    else if (_verifiedPosts.ContainsKey(sourcePost.Slug))
-                    {
-                        Interlocked.Increment(ref verified);
-                    }
-                    else if (FindTargetForSource(sourcePost, targetPostsBySlug) is { } targetPost)
-                    {
-                        var (changed, fullyResolved) = await UpdatePostIfNeeded(sourcePost, targetPost);
-                        if (changed)
-                            Interlocked.Increment(ref updated);
-                        else
-                            Interlocked.Increment(ref skipped);
-
-                        // Mark verified only when content has no unresolved source URLs.
-                        // Otherwise the post will be re-examined next run, giving a chance
-                        // to retry uploads / rewrites once media becomes available.
-                        if (fullyResolved)
-                            _verifiedPosts[sourcePost.Slug] = true;
-                    }
                     else
                     {
-                        var newPost = await CreatePostOnTarget(sourcePost);
-                        if (newPost != null)
+                        var targetPost = FindTargetForSource(sourcePost, targetPostsBySlug);
+
+                        string? targetContent = null;
+                        if (targetPost != null && targetContentsBySlug != null &&
+                            targetContentsBySlug.TryGetValue(targetPost.Slug, out var tc))
+                            targetContent = tc;
+
+                        // A previous buggy run may have marked posts verified while skipping
+                        // their featured image (empty FeaturedMediaUrl in backup file, no
+                        // fallback resolution). Re-examine if source has a featured image
+                        // but target doesn't — UpdatePostIfNeeded will set it via ResolveFeaturedUrl.
+                        var needsFeaturedRecheck = targetPost != null
+                                                   && sourcePost.FeaturedMedia > 0
+                                                   && targetPost.FeaturedMedia == 0;
+
+                        // Same rationale for body images: pre-fullyResolved-fix runs marked
+                        // posts verified even when target content still had source URLs.
+                        // If target body still references the source domain, force a recheck
+                        // so UpdatePostIfNeeded can upload missing media and rewrite the URLs.
+                        // Only recheck for *fixable* URLs — bodies whose remaining source URLs
+                        // are all permanent link rot (known-dead) can never resolve, so keep
+                        // them in the verified-skip fast path instead of re-examining forever.
+                        var needsContentRecheck = !string.IsNullOrEmpty(targetContent) &&
+                                                  HasFixableSourceMedia(targetContent);
+
+                        if (_verifiedPosts.ContainsKey(sourcePost.Slug) &&
+                            !needsFeaturedRecheck && !needsContentRecheck)
                         {
-                            lock (postLock) { _targetPosts.Add(newPost); }
-                            // CreatePostOnTarget rewrites URLs in-flight; only verify if
-                            // the content it sent has no source URLs left.
-                            if (!HasUnresolvedSourceMedia(newPost.Content.Rendered))
+                            Interlocked.Increment(ref verified);
+                        }
+                        else if (targetPost != null)
+                        {
+                            var (changed, fullyResolved) = await UpdatePostIfNeeded(sourcePost, targetPost, targetContent);
+                            if (changed)
+                                Interlocked.Increment(ref updated);
+                            else
+                                Interlocked.Increment(ref skipped);
+
+                            // Mark verified only when content has no unresolved source URLs.
+                            // Otherwise the post will be re-examined next run, giving a chance
+                            // to retry uploads / rewrites once media becomes available.
+                            if (fullyResolved)
                                 _verifiedPosts[sourcePost.Slug] = true;
                         }
-                        Interlocked.Increment(ref created);
+                        else
+                        {
+                            var newPost = await CreatePostOnTarget(sourcePost);
+                            if (newPost != null)
+                            {
+                                lock (postLock) { _targetPosts.Add(newPost); }
+
+                                // Empirically, fresh posts from CreatePostOnTarget often come
+                                // back with featured_media=0 and source-domain URLs in body —
+                                // the exact same upload+rewrite logic that succeeds on the
+                                // update path. Symptom users see: "first migrate skips the
+                                // new post's images, second migrate fixes them." Run the
+                                // update path immediately against the just-created post so
+                                // a single migrate run is enough.
+                                var needsRepair = HasUnresolvedSourceMedia(newPost.Content.Rendered)
+                                                  || (sourcePost.FeaturedMedia > 0 && newPost.FeaturedMedia == 0);
+                                var resolved = !HasUnresolvedSourceMedia(newPost.Content.Rendered);
+                                if (needsRepair)
+                                {
+                                    var (_, fullyResolved) = await UpdatePostIfNeeded(
+                                        sourcePost, newPost, newPost.Content.Rendered);
+                                    resolved = fullyResolved;
+                                }
+
+                                if (resolved)
+                                    _verifiedPosts[sourcePost.Slug] = true;
+                            }
+                            Interlocked.Increment(ref created);
+                        }
                     }
                 }
                 catch (Exception ex)
                 {
-                    progress.Complete($"Error on {sourcePost.Slug}: {ex.Message}");
+                    Console.WriteLine($"\n    Error on {sourcePost.Slug}: {ex.Message}");
                 }
 
                 var count = Interlocked.Increment(ref done);
                 progress.Update(count, total, sourcePost.Slug);
+
+                // Flush verified cache periodically so a mid-run hang preserves progress.
+                if (count % 100 == 0)
+                {
+                    try { SaveVerifiedPostsCache(); } catch { /* best effort */ }
+                }
             });
 
+        SaveVerifiedPostsCache();
         progress.Complete($"Created {created}, updated {updated}, skipped {skipped}, verified {verified} (cached).");
     }
 
@@ -231,7 +285,7 @@ public partial class WpMigrator
     {
         Console.WriteLine("\n  Repairing posts (content URLs + featured images)...");
 
-        var targetPostsBySlug = _targetPosts.ToDictionary(p => p.Slug, p => p);
+        var targetPostsBySlug = BuildBySlug(_targetPosts, p => p.Slug, "target posts");
         var repaired = 0;
         var skipped = 0;
         var done = 0;
@@ -268,20 +322,23 @@ public partial class WpMigrator
                                 updates["content"] = rewritten;
                         }
 
-                        // Fix featured image if missing
-                        if (targetPost.FeaturedMedia == 0 &&
-                            _backupFeaturedMediaUrls.TryGetValue(sourcePost.Slug, out var featuredUrl))
+                        // Fix featured image if missing — resolve via backup → in-memory index → live API
+                        if (targetPost.FeaturedMedia == 0)
                         {
-                            var existingMedia = FindMediaOnTarget(featuredUrl);
-                            if (existingMedia != null)
+                            var featuredUrl = await ResolveFeaturedUrl(sourcePost);
+                            if (!string.IsNullOrEmpty(featuredUrl))
                             {
-                                updates["featured_media"] = existingMedia.Id;
-                            }
-                            else
-                            {
-                                var uploaded = await UploadMedia(featuredUrl, attachToPostId: targetPost.Id, postLink: sourcePost.Link);
-                                if (uploaded != null)
-                                    updates["featured_media"] = uploaded.Id;
+                                var existingMedia = FindMediaOnTarget(featuredUrl);
+                                if (existingMedia != null)
+                                {
+                                    updates["featured_media"] = existingMedia.Id;
+                                }
+                                else
+                                {
+                                    var uploaded = await UploadMedia(featuredUrl, attachToPostId: targetPost.Id, postLink: sourcePost.Link);
+                                    if (uploaded != null)
+                                        updates["featured_media"] = uploaded.Id;
+                                }
                             }
                         }
 
@@ -332,17 +389,30 @@ public partial class WpMigrator
         content = ProcessShortcodes(content);
         content = CleanupHtml(content);
 
-        var uploadedMediaIds = await UploadAllPostMedia(sourcePost.Content.Rendered, postLink: sourcePost.Link);
+        // Upload from the same post-processed content that we'll rewrite and send.
+        // Using the raw source content misses URLs that ProcessShortcodes introduces
+        // (e.g. [video src=…] → <video src=…>), leaving them as source-domain in the
+        // final post body because RewriteContentUrls can't find them in the target lib.
+        var uploadedMediaIds = await UploadAllPostMedia(content, postLink: sourcePost.Link);
         var authorId = ResolveTargetAuthorId(sourcePost.Author);
 
         // Rewrite source domain URLs to actual target media URLs
         content = RewriteContentUrls(content);
 
         int? featuredMediaId = null;
-        if (_backupFeaturedMediaUrls.TryGetValue(sourcePost.Slug, out var featuredUrl))
+        // Resolve featured URL with fallbacks: backup-file dict → in-memory source-media
+        // index → direct source API. Backup files written before BuildSourceMediaIndex
+        // succeeded may have empty FeaturedMediaUrl, leaving the dict missing entries.
+        var featuredUrl = await ResolveFeaturedUrl(sourcePost);
+        if (!string.IsNullOrEmpty(featuredUrl))
         {
             var uploaded = await UploadMedia(featuredUrl, postLink: sourcePost.Link);
             if (uploaded != null) featuredMediaId = uploaded.Id;
+            else Console.WriteLine($"\n    {sourcePost.Slug}: featured upload failed for {featuredUrl}");
+        }
+        else if (sourcePost.FeaturedMedia > 0)
+        {
+            Console.WriteLine($"\n    {sourcePost.Slug}: source has featured_media={sourcePost.FeaturedMedia} but URL not resolved");
         }
 
         var excerpt = sourcePost.Excerpt.Rendered;
@@ -375,8 +445,10 @@ public partial class WpMigrator
             new ParallelOptions { MaxDegreeOfParallelism = 4 },
             async (mediaId, _) => await AttachMediaToPost(mediaId, createdPost.Id));
 
-        // Update meta — use inline meta from bulk fetch, avoid extra API call
-        var customMeta = sourcePost.Meta?
+        // Lazy-fetch meta only at create time (bulk fetch drops `meta` for perf).
+        // Only post_view* keys are propagated to target.
+        var sourceMeta = sourcePost.Meta ?? await GetPostMeta(sourcePost.Id);
+        var customMeta = sourceMeta?
             .Where(kv => kv.Key.StartsWith("post_view"))
             .ToDictionary(kv => kv.Key, kv => kv.Value);
         if (customMeta is { Count: > 0 }) await UpdatePostMeta(createdPost.Id, customMeta);
@@ -384,7 +456,8 @@ public partial class WpMigrator
         return createdPost;
     }
 
-    private async Task<(bool Changed, bool FullyResolved)> UpdatePostIfNeeded(WpPost sourcePost, WpPost targetPost)
+    private async Task<(bool Changed, bool FullyResolved)> UpdatePostIfNeeded(
+        WpPost sourcePost, WpPost targetPost, string? targetContent = null)
     {
         var updates = new Dictionary<string, object>();
         var fullyResolved = true;
@@ -417,37 +490,57 @@ public partial class WpMigrator
             _targetCategoriesDict.Values.Any(c => c.Id == id &&
                 c.Slug.Equals("video-of-the-day", StringComparison.OrdinalIgnoreCase)));
 
-        if (!isVideoOfTheDay && targetPost.FeaturedMedia == 0 &&
-            _backupFeaturedMediaUrls.TryGetValue(sourcePost.Slug, out var featuredUrl))
+        if (!isVideoOfTheDay && targetPost.FeaturedMedia == 0)
         {
-            var existingMedia = FindMediaOnTarget(featuredUrl);
-            if (existingMedia != null)
+            var featuredUrl = await ResolveFeaturedUrl(sourcePost);
+            if (!string.IsNullOrEmpty(featuredUrl))
             {
-                updates["featured_media"] = existingMedia.Id;
-            }
-            else
-            {
-                var uploaded = await UploadMedia(featuredUrl, attachToPostId: targetPost.Id, postLink: sourcePost.Link);
-                if (uploaded != null)
-                    updates["featured_media"] = uploaded.Id;
+                var existingMedia = FindMediaOnTarget(featuredUrl);
+                if (existingMedia != null)
+                {
+                    updates["featured_media"] = existingMedia.Id;
+                }
+                else
+                {
+                    var uploaded = await UploadMedia(featuredUrl, attachToPostId: targetPost.Id, postLink: sourcePost.Link);
+                    if (uploaded != null)
+                        updates["featured_media"] = uploaded.Id;
+                }
             }
         }
 
-        // Check for missing inline media — upload first so URL mapping is populated
+        // Process once, then both upload and rewrite key off the same content —
+        // otherwise shortcode-introduced URLs (e.g. [video src=…] → <video src=…>)
+        // are missed by the raw-based upload and left source-domain after rewrite.
+        var content = sourcePost.Content.Rendered;
+        content = ProcessShortcodes(content);
+        content = CleanupHtml(content);
+
         var missingMedia = FindMissingMedia(sourcePost.Slug);
-        if (missingMedia.Count > 0)
-            await UploadAllPostMedia(sourcePost.Content.Rendered, targetPost.Id, sourcePost.Link);
+        // Always upload from processed content. UploadMedia short-circuits when no
+        // source URLs are present and uses the existing-media fast path otherwise,
+        // so this stays cheap on posts that don't need any upload work.
+        await UploadAllPostMedia(content, targetPost.Id, sourcePost.Link);
 
         // Rewrite content URLs from source domain to actual target media URLs
         if (HasSourceContentUrls(sourcePost.Content.Rendered))
         {
-            var content = sourcePost.Content.Rendered;
-            content = ProcessShortcodes(content);
-            content = CleanupHtml(content);
             var rewritten = RewriteContentUrls(content);
-            if (rewritten != content)
+
+            // With actual target content, push only when target still has a *fixable*
+            // source URL — avoids retriggering save_post hooks on already-clean posts AND
+            // on link-rot posts whose only remaining source URLs are permanently dead
+            // (re-pushing the same body every run was the main reason migrate took hours).
+            // Without target content, fall back to comparing against the post-processed source.
+            var shouldPush = targetContent == null
+                ? rewritten != content
+                : HasFixableSourceMedia(targetContent);
+
+            if (shouldPush)
                 updates["content"] = rewritten;
-            if (HasUnresolvedSourceMedia(rewritten))
+            // Block the verified-cache only if a still-fixable URL remains. Known-dead
+            // URLs can never resolve, so don't keep the post out of the cache for them.
+            if (HasFixableSourceMedia(rewritten))
                 fullyResolved = false;
         }
 
@@ -464,22 +557,14 @@ public partial class WpMigrator
     /// Protocol-agnostic check: does this content contain any source-domain WP URL?
     /// </summary>
     private bool HasSourceContentUrls(string content) =>
-        !string.IsNullOrEmpty(content) &&
-        System.Text.RegularExpressions.Regex.IsMatch(
-            content,
-            @"https?://" + System.Text.RegularExpressions.Regex.Escape(_config.SourceDomain) + @"/wp-content",
-            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        !string.IsNullOrEmpty(content) && _hasSourceContentRegex.IsMatch(content);
 
     /// <summary>
     /// True if content still has source-domain media URLs after rewrite — means
     /// some media wasn't found in target library and target images will 404.
     /// </summary>
     private bool HasUnresolvedSourceMedia(string content) =>
-        !string.IsNullOrEmpty(content) &&
-        System.Text.RegularExpressions.Regex.IsMatch(
-            content,
-            @"https?://" + System.Text.RegularExpressions.Regex.Escape(_config.SourceDomain) + @"/wp-content/uploads",
-            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        !string.IsNullOrEmpty(content) && _hasUnresolvedSourceMediaRegex.IsMatch(content);
 
     private int ResolveTargetAuthorId(int sourceAuthorId)
     {
@@ -497,7 +582,7 @@ public partial class WpMigrator
     {
         Console.WriteLine("\n  Checking for duplicates...");
 
-        var targetPostsBySlug = _targetPosts.ToDictionary(p => p.Slug, p => p);
+        var targetPostsBySlug = BuildBySlug(_targetPosts, p => p.Slug, "target posts");
         var duplicates = new List<WpPost>();
 
         foreach (var sourcePost in _sourcePosts)
@@ -532,7 +617,7 @@ public partial class WpMigrator
             try
             {
                 var url = $"{_config.TargetWpApiUrl}wp/v2/posts/{post.Id}?force=true";
-                var response = await SendWriteAsync(() =>
+                var response = await SendWriteAsync(url, 0, () =>
                     _httpClient.SendAsync(CreateAuthenticatedRequest(HttpMethod.Delete, url)));
                 if (response.IsSuccessStatusCode) _targetPosts.RemoveAll(p => p.Id == post.Id);
             }

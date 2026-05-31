@@ -50,8 +50,12 @@ public partial class WpMigrator
             .Select(id => _sourceCategoriesDict[id].Name)
             .ToList();
 
-        // Extract media URLs from content
-        var mediaUrls = ExtractMediaUrls(post.Content.Rendered)
+        // Extract media URLs from POST-PROCESSED content so shortcode-introduced
+        // URLs (e.g. [video src=…] → <video src=…>) get backed up too. Raw
+        // extraction was leaving those URLs out of the backup folder, so the
+        // upload step had to rely on the live-source fallback every time.
+        var processed = CleanupHtml(ProcessShortcodes(post.Content.Rendered));
+        var mediaUrls = ExtractMediaUrls(processed)
             .Where(IsSourceMedia)
             .ToList();
 
@@ -162,7 +166,7 @@ public partial class WpMigrator
 
     private async Task SyncAllBackupMedia()
     {
-        var postsBySlug = _sourcePosts.ToDictionary(p => p.Slug, p => p);
+        var postsBySlug = BuildBySlug(_sourcePosts, p => p.Slug, "source posts");
 
         // Collect all (url, mediaFolder) pairs that need downloading
         var slugsWithMedia = new HashSet<string>(_backupMediaUrls.Keys);
@@ -335,12 +339,50 @@ public partial class WpMigrator
         catch { /* ignore corrupt cache */ }
     }
 
+    private readonly object _verifiedSaveLock = new();
+
     private void SaveVerifiedPostsCache()
     {
-        var slugs = _verifiedPosts.Keys.OrderBy(s => s).ToList();
-        File.WriteAllText(
-            Path.Combine(_backupRoot, "verified-posts.json"),
-            JsonConvert.SerializeObject(slugs));
+        // Called from inside the parallel sync loop on every 100th post — multiple
+        // workers can race here. Serialize so File.WriteAllText doesn't tear the JSON.
+        lock (_verifiedSaveLock)
+        {
+            var slugs = _verifiedPosts.Keys.OrderBy(s => s).ToList();
+            File.WriteAllText(
+                Path.Combine(_backupRoot, "verified-posts.json"),
+                JsonConvert.SerializeObject(slugs));
+        }
+    }
+
+    private void LoadDeadSourceMediaCache()
+    {
+        var path = Path.Combine(_backupRoot, "dead-source-media.json");
+        if (!File.Exists(path)) return;
+
+        try
+        {
+            var json = File.ReadAllText(path);
+            var keys = JsonConvert.DeserializeObject<List<string>>(json) ?? [];
+            foreach (var key in keys)
+                _deadSourceMedia[key] = true;
+            Console.WriteLine($"  Loaded {keys.Count} known-unavailable media file(s) from cache.");
+        }
+        catch { /* ignore corrupt cache */ }
+    }
+
+    private readonly object _deadSaveLock = new();
+
+    private void SaveDeadSourceMediaCache()
+    {
+        // Written from the parallel sync loop (UploadMedia) and at run end —
+        // serialize so concurrent writers can't tear the JSON.
+        lock (_deadSaveLock)
+        {
+            var keys = _deadSourceMedia.Keys.OrderBy(k => k).ToList();
+            File.WriteAllText(
+                Path.Combine(_backupRoot, "dead-source-media.json"),
+                JsonConvert.SerializeObject(keys));
+        }
     }
 
     private async Task SaveMetadataToBackup()

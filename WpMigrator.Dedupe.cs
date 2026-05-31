@@ -165,7 +165,7 @@ public partial class WpMigrator
             try
             {
                 var url = $"{_config.TargetWpApiUrl}wp/v2/media/{id}?force=true";
-                var resp = await SendWriteAsync(() =>
+                var resp = await SendWriteAsync(url, 0, () =>
                     _httpClient.SendAsync(CreateAuthenticatedRequest(HttpMethod.Delete, url)));
                 if (resp.IsSuccessStatusCode) deleted++;
                 else failed++;

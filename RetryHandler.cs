@@ -58,6 +58,13 @@ public class RetryHandler(HttpMessageHandler innerHandler) : DelegatingHandler(i
                 var delay = (i + 1) * 2000;
                 await Task.Delay(delay, cancellationToken);
             }
+            // TaskCanceledException without caller cancellation = HttpClient.Timeout fired.
+            // Treat as transient (server hung) and retry. Caller cancellation re-throws.
+            catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested && i < MaxRetries)
+            {
+                var delay = (i + 1) * 5000;
+                await Task.Delay(delay, cancellationToken);
+            }
         }
 
         return response ?? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);

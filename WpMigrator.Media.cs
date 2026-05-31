@@ -154,6 +154,37 @@ public partial class WpMigrator
         return url.Contains(_config.SourceWpUrl) || url.Contains($"{_config.SourceDomain}/wp-content/uploads");
     }
 
+    /// <summary>
+    /// Resolves a source post's featured image URL with three-stage fallback:
+    /// (1) backup-file dict, (2) in-memory source-media index, (3) live source API.
+    /// Stage 1 may be empty for posts whose backup was written before BuildSourceMediaIndex
+    /// succeeded; stage 2 may be empty if the bulk batch failed silently.
+    /// </summary>
+    private async Task<string?> ResolveFeaturedUrl(WpPost sourcePost)
+    {
+        if (_backupFeaturedMediaUrls.TryGetValue(sourcePost.Slug, out var fromBackup) && !string.IsNullOrEmpty(fromBackup))
+            return fromBackup;
+
+        if (sourcePost.FeaturedMedia <= 0) return null;
+
+        if (_sourceMediaById.TryGetValue(sourcePost.FeaturedMedia, out var fromIndex) && !string.IsNullOrEmpty(fromIndex))
+        {
+            _backupFeaturedMediaUrls[sourcePost.Slug] = fromIndex;
+            return fromIndex;
+        }
+
+        // Last resort: live fetch from source. Caller is on the post-sync hot path,
+        // so this only fires for the minority that fell through the bulk index.
+        var live = await GetMediaUrl(sourcePost.FeaturedMedia);
+        if (!string.IsNullOrEmpty(live))
+        {
+            _sourceMediaById[sourcePost.FeaturedMedia] = live;
+            _backupFeaturedMediaUrls[sourcePost.Slug] = live;
+            return live;
+        }
+        return null;
+    }
+
     private async Task<string?> GetMediaUrl(int mediaId)
     {
         try
@@ -226,17 +257,64 @@ public partial class WpMigrator
                 lookupSanitized = baseSanitized;
             }
 
-            var backupFile = FindInBackup(lookupOriginal) ?? FindInBackup(lookupSanitized);
-            if (backupFile == null)
-            {
-                _uploadErrors.Add($"{lookupOriginal}: not in backup{FormatPostLink(postLink)}");
-                return null;
-            }
+            // Live-fetch URL: when uploading a size variant we want the BASE file
+            // (lookupOriginal), but sourceUrl still points at the variant. Build the
+            // base URL by swapping just the filename — must be computed before we
+            // reassign originalFileName below.
+            var isSizeVariant = baseOriginal != originalFileName;
+            var liveUrl = isSizeVariant
+                ? sourceUrl[..(sourceUrl.LastIndexOf('/') + 1)] + lookupOriginal
+                : sourceUrl;
+
             // Use the base name for the upload so WP stores it canonically.
             originalFileName = lookupOriginal;
             fileName = lookupSanitized;
 
-            var mediaBytes = await File.ReadAllBytesAsync(backupFile);
+            byte[]? mediaBytes = null;
+            var backupFile = FindInBackup(lookupOriginal) ?? FindInBackup(lookupSanitized);
+            if (backupFile != null)
+            {
+                mediaBytes = await File.ReadAllBytesAsync(backupFile);
+            }
+            else if (_deadSourceMedia.ContainsKey(lookupOriginal))
+            {
+                // Recorded unavailable on a prior run (permanent link rot). Skip the live
+                // re-download entirely — retrying just burns the request timeout + retry
+                // budget on every migrate. Delete dead-source-media.json to force a retry.
+                _uploadErrors.Add($"{lookupOriginal}: not in backup, source unavailable (cached){FormatPostLink(postLink)}");
+                return null;
+            }
+            else
+            {
+                // Backup miss → try live source. The pre-refactor ProcessContentMedia
+                // always downloaded from source URL directly; the backup-only path
+                // regressed posts whose body media isn't in our backup (shortcode-
+                // introduced URLs, files added since last backup, or filename
+                // mismatches in the backup index). If source still serves the file
+                // we can recover here and never see "not in backup" for live URLs.
+                //
+                // Short per-attempt timeout on the connect/header phase + no retry: a
+                // dead URL must fail in seconds, not the full 90s client timeout × 3
+                // retries. The cts cancels GetAsync (which RetryHandler won't retry once
+                // the caller's token is cancelled); the body read keeps the default
+                // timeout so a slow-but-live large file isn't truncated.
+                try
+                {
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+                    using var liveResponse = await _httpClient.GetAsync(
+                        liveUrl, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+                    if (liveResponse.IsSuccessStatusCode)
+                        mediaBytes = await liveResponse.Content.ReadAsByteArrayAsync();
+                }
+                catch { /* fall through to error */ }
+
+                if (mediaBytes == null)
+                {
+                    _deadSourceMedia[lookupOriginal] = true;
+                    _uploadErrors.Add($"{lookupOriginal}: not in backup, source unavailable{FormatPostLink(postLink)}");
+                    return null;
+                }
+            }
 
             var uploadUrl = $"{_config.TargetWpApiUrl}wp/v2/media";
             if (attachToPostId.HasValue)
@@ -252,7 +330,7 @@ public partial class WpMigrator
             };
             request.Content = uploadContent;
 
-            var response = await SendWriteAsync(() => _httpClient.SendAsync(request));
+            var response = await SendWriteAsync(uploadUrl, mediaBytes.Length, () => _httpClient.SendAsync(request));
             var json = await response.Content.ReadAsStringAsync();
 
             if (!response.IsSuccessStatusCode)
@@ -328,6 +406,22 @@ public partial class WpMigrator
     }
 
     private static readonly Regex SizeSuffixRegex = new(@"^(.+)-\d+x\d+(\.[^.]+)$", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Stable key for the known-unavailable cache: the base (size-suffix-stripped)
+    /// filename of a source media URL. Mirrors UploadMedia's lookupOriginal so a dead
+    /// base file matches all of its size-variant URLs found in post content.
+    /// </summary>
+    private static string DeadMediaKey(string url)
+    {
+        try
+        {
+            var fileName = Path.GetFileName(new Uri(url).LocalPath);
+            var m = SizeSuffixRegex.Match(fileName);
+            return m.Success ? m.Groups[1].Value + m.Groups[2].Value : fileName;
+        }
+        catch { return url; }
+    }
 
     private static (string OriginalBase, string SanitizedBase) StripSizeSuffix(string original, string sanitized)
     {

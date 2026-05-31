@@ -56,7 +56,8 @@
       "PowerShell($a=Get-Content settings.json -Raw|ConvertFrom-Json; $b=Get-Content bin/Debug/net9.0/settings.json -Raw|ConvertFrom-Json; \"root len=$\\($a.TargetPassword.Length\\) bin len=$\\($b.TargetPassword.Length\\) same=$\\($a.TargetPassword -ceq $b.TargetPassword\\) binUser=$\\($b.TargetUsername\\)\"; \"root hex: $\\(\\(\\($a.TargetPassword.ToCharArray\\(\\)|ForEach-Object {[int]$_}\\) -join ','\\)\\)\"; \"bin  hex: $\\(\\(\\($b.TargetPassword.ToCharArray\\(\\)|ForEach-Object {[int]$_}\\) -join ','\\)\\)\")",
       "PowerShell($b=Get-Content bin/Debug/net9.0/settings.json -Raw|ConvertFrom-Json; \"len=$\\($b.TargetPassword.Length\\) user=$\\($b.TargetUsername\\) src=$\\($b.SourceDomain\\) tgt=$\\($b.TargetDomain\\)\"; \"hex: $\\(\\(\\($b.TargetPassword.ToCharArray\\(\\)|ForEach-Object {[int]$_}\\) -join ','\\)\\)\")",
       "PowerShell(pip *)",
-      "Bash(dotnet restore *)"
+      "Bash(dotnet restore *)",
+      "PowerShell(dotnet build *)"
     ],
     "deny": [],
     "ask": []

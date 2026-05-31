@@ -65,15 +65,50 @@ public partial class WpMigrator
     // Posts verified as fully synced — skip on subsequent runs
     private readonly ConcurrentDictionary<string, bool> _verifiedPosts = new(StringComparer.OrdinalIgnoreCase);
 
+    // Source media files known to be permanently unavailable (link rot: source WP
+    // no longer serves the base file). Keyed by base filename (size-suffix stripped),
+    // matching UploadMedia's lookupOriginal. Lets us (a) skip the slow live re-download
+    // on every run and (b) treat posts whose only unresolved URLs are dead as fully
+    // resolved, so they stop being re-examined. Persisted to dead-source-media.json.
+    private readonly ConcurrentDictionary<string, bool> _deadSourceMedia = new(StringComparer.OrdinalIgnoreCase);
+
+    // Source-domain regexes — built once per migrator, hit in the per-post hot path
+    private readonly Regex _contentUrlRegex;
+    private readonly Regex _hasSourceContentRegex;
+    private readonly Regex _hasUnresolvedSourceMediaRegex;
+
     public WpMigrator(SiteConfig config)
     {
         _config = config;
-        var retryHandler = new RetryHandler(new HttpClientHandler())
+        var escapedDomain = Regex.Escape(_config.SourceDomain);
+        _contentUrlRegex = new Regex(
+            @"https?://" + escapedDomain + @"/wp-content/uploads/[^\s""'<>\)]+",
+            RegexOptions.Compiled);
+        _hasSourceContentRegex = new Regex(
+            @"https?://" + escapedDomain + @"/wp-content",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        _hasUnresolvedSourceMediaRegex = new Regex(
+            @"https?://" + escapedDomain + @"/wp-content/uploads",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        // Recycle pooled sockets every 2 min so silently-killed idle connections
+        // (Cloudflare / nginx LB closing without FIN) don't get reused and hang.
+        // ConnectTimeout caps DNS+TLS so a stalled handshake doesn't burn the full timeout.
+        var socketsHandler = new SocketsHttpHandler
+        {
+            PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+            PooledConnectionIdleTimeout = TimeSpan.FromMinutes(1),
+            ConnectTimeout = TimeSpan.FromSeconds(15)
+        };
+        var retryHandler = new RetryHandler(socketsHandler)
         {
             MaxRetries = 3,
             ReauthAsync = ReauthAsync
         };
-        _httpClient = new HttpClient(retryHandler) { Timeout = TimeSpan.FromMinutes(30) };
+        // Per-request timeout: short enough to fail fast on hung WP requests,
+        // long enough to cover legit slow operations (large content updates,
+        // attachment uploads). RetryHandler covers transient failures.
+        _httpClient = new HttpClient(retryHandler) { Timeout = TimeSpan.FromSeconds(90) };
     }
 
     private async Task<string?> ReauthAsync()
@@ -94,10 +129,26 @@ public partial class WpMigrator
         LoadSourcePostsFromBackup();
         LoadTargetPostCache();
         LoadVerifiedPostsCache();
+        LoadDeadSourceMediaCache();
     }
 
     public async Task Migrate()
     {
+        // Save verified-posts cache on Ctrl-C so a hang doesn't lose run progress.
+        // Process keeps running long enough to flush, then exits via natural cancel.
+        ConsoleCancelEventHandler? cancelHandler = (_, e) =>
+        {
+            try { SaveVerifiedPostsCache(); SaveTargetMediaCache(); SaveDeadSourceMediaCache(); } catch { /* best effort */ }
+            Console.WriteLine("\n  Caches flushed on cancel.");
+            // Surface upload errors on Ctrl-C too — otherwise an aborted run
+            // hides exactly the diagnostics we need to see why files failed
+            // to land on target.
+            try { ReportUploadErrors(); } catch { /* best effort */ }
+        };
+        Console.CancelKeyPress += cancelHandler;
+
+        try
+        {
         // 1. Fetch source data
         await FetchSourceData();
         BuildLookupDictionaries();
@@ -134,20 +185,45 @@ public partial class WpMigrator
         await DownloadTargetMediaList();
         BuildLookupDictionaries();
 
+        // Pull target body content so SyncAllPosts can tell verified-but-stale posts
+        // (target body still pointing at source) apart from verified-and-clean ones.
+        // Without this, the verified-cache shortcut hides posts whose body never got
+        // its source URLs rewritten by an earlier run.
+        Console.WriteLine("\n  Fetching target post content...");
+        var targetContents = await FetchTargetContents();
+        var targetContentsBySlug = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in _targetPosts)
+        {
+            if (p.Id > 0 && targetContents.TryGetValue(p.Id, out var v))
+                targetContentsBySlug[p.Slug] = v.Content;
+        }
+        Console.WriteLine($"  Got content for {targetContents.Count} target post(s).");
+
         // 4. Sync to target
         await SyncAuthors();
         BuildLookupDictionaries();
         await SyncTaxonomy();
         BuildLookupDictionaries();
-        await SyncAllPosts();
+        await SyncAllPosts(targetContentsBySlug);
+
+        // Flush as soon as posts done — earlier crashes (dedupe) shouldn't lose verified cache.
+        SaveVerifiedPostsCache();
+        SaveTargetMediaCache();
+        SaveDeadSourceMediaCache();
 
         // 5. Cleanup
         await FindAndDeleteDuplicates();
         SaveTargetMediaCache();
         SaveVerifiedPostsCache();
+        SaveDeadSourceMediaCache();
 
         ReportUploadErrors();
         Console.WriteLine("\n  Migration complete!");
+        }
+        finally
+        {
+            Console.CancelKeyPress -= cancelHandler;
+        }
     }
 
     public async Task Repair()
@@ -271,6 +347,44 @@ public partial class WpMigrator
         await PrintStatus();
     }
 
+    /// <summary>
+    /// Repro tool for server-side hang debugging. Hits a single target post with the
+    /// minimal noop update (current author re-set to itself) and times each phase.
+    /// While running, capture PHP-FPM slow log + MySQL SHOW PROCESSLIST on the server.
+    /// </summary>
+    public async Task HitPost(string slug)
+    {
+        await Authenticate();
+        Console.WriteLine($"\n  Resolving slug '{slug}' on target...");
+
+        var swFetch = System.Diagnostics.Stopwatch.StartNew();
+        var url = $"{_config.TargetWpApiUrl}wp/v2/posts?slug={Uri.EscapeDataString(slug)}&_fields=id,slug,author&per_page=5";
+        var resp = await _httpClient.SendAsync(CreateAuthenticatedRequest(HttpMethod.Get, url));
+        var json = await resp.Content.ReadAsStringAsync();
+        swFetch.Stop();
+        Console.WriteLine($"  GET took {swFetch.ElapsedMilliseconds} ms, status {(int)resp.StatusCode}");
+        if (!resp.IsSuccessStatusCode) { Console.WriteLine($"  Body: {json[..Math.Min(json.Length, 500)]}"); return; }
+
+        var posts = JsonConvert.DeserializeObject<List<WpPost>>(json) ?? [];
+        var match = posts.FirstOrDefault(p => p.Slug == slug);
+        if (match == null) { Console.WriteLine("  No matching post."); return; }
+        Console.WriteLine($"  Post id={match.Id} author={match.Author}");
+
+        Console.WriteLine($"\n  POSTing noop author update (author={match.Author})...");
+        var swPost = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            await PostJsonAsync($"{_config.TargetWpApiUrl}wp/v2/posts/{match.Id}", new { author = match.Author });
+            swPost.Stop();
+            Console.WriteLine($"  POST took {swPost.ElapsedMilliseconds} ms — {(swPost.ElapsedMilliseconds > 5000 ? "SLOW" : "ok")}");
+        }
+        catch (Exception ex)
+        {
+            swPost.Stop();
+            Console.WriteLine($"  POST failed after {swPost.ElapsedMilliseconds} ms: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
     private HttpRequestMessage CreateAuthenticatedRequest(HttpMethod method, string url)
     {
         var request = new HttpRequestMessage(method, url);
@@ -281,20 +395,25 @@ public partial class WpMigrator
 
     private async Task<HttpResponseMessage> PostJsonAsync(string url, object payload)
     {
-        return await SendWriteAsync(() =>
+        var json = JsonConvert.SerializeObject(payload);
+        return await SendWriteAsync(url, json.Length, () =>
         {
             var request = CreateAuthenticatedRequest(HttpMethod.Post, url);
-            request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
+            request.Content = new StringContent(json, Encoding.UTF8, "application/json");
             return _httpClient.SendAsync(request);
         });
     }
 
+    // Anything longer than this gets logged so we can correlate slow writes
+    // to specific endpoints / payload sizes during a migrate run.
+    private const int SlowWriteThresholdMs = 5000;
+
     /// <summary>
     /// Funnels every write (POST/PUT/PATCH/DELETE/multipart upload) through a
     /// single semaphore + spacing delay so concurrent callers can't pile up
-    /// save_post hooks on the WP server.
+    /// save_post hooks on the WP server. Logs writes exceeding SlowWriteThresholdMs.
     /// </summary>
-    private async Task<HttpResponseMessage> SendWriteAsync(Func<Task<HttpResponseMessage>> sendFunc)
+    private async Task<HttpResponseMessage> SendWriteAsync(string url, int payloadBytes, Func<Task<HttpResponseMessage>> sendFunc)
     {
         await _writeSemaphore.WaitAsync();
         try
@@ -304,7 +423,16 @@ public partial class WpMigrator
             if (elapsedMs < MinWriteSpacingMs)
                 await Task.Delay((int)(MinWriteSpacingMs - elapsedMs));
             Interlocked.Exchange(ref _lastWriteTicks, DateTime.UtcNow.Ticks);
-            return await sendFunc();
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var response = await sendFunc();
+            sw.Stop();
+            if (sw.ElapsedMilliseconds >= SlowWriteThresholdMs)
+            {
+                var status = (int)response.StatusCode;
+                Console.WriteLine($"\n  [slow-write] {sw.ElapsedMilliseconds}ms {status} {payloadBytes}B {ShortenUrl(url)}");
+            }
+            return response;
         }
         finally
         {
@@ -312,22 +440,42 @@ public partial class WpMigrator
         }
     }
 
+    private string ShortenUrl(string url)
+    {
+        // Strip the WP REST prefix so the log line is readable
+        if (url.StartsWith(_config.TargetWpApiUrl, StringComparison.OrdinalIgnoreCase))
+            return "T:" + url[_config.TargetWpApiUrl.Length..];
+        if (url.StartsWith(_config.SourceWpApiUrl, StringComparison.OrdinalIgnoreCase))
+            return "S:" + url[_config.SourceWpApiUrl.Length..];
+        return url;
+    }
+
+    private const int SlowReadThresholdMs = 5000;
+
     /// <summary>
     /// Fetch one page from a WP REST endpoint. Returns items and the X-WP-TotalPages value.
+    /// Logs reads exceeding SlowReadThresholdMs for hang diagnostics.
     /// </summary>
     private async Task<(List<T> Items, int TotalPages)> FetchPageAsync<T>(
         string apiUrl, string endpoint, int page, bool useAuth = false, string? extraQuery = null)
     {
+        var url = $"{apiUrl}wp/v2/{endpoint}?per_page=100&page={page}";
+        if (!string.IsNullOrEmpty(extraQuery)) url += $"&{extraQuery}";
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            var url = $"{apiUrl}wp/v2/{endpoint}?per_page=100&page={page}";
-            if (!string.IsNullOrEmpty(extraQuery)) url += $"&{extraQuery}";
-
             var response = useAuth
                 ? await _httpClient.SendAsync(CreateAuthenticatedRequest(HttpMethod.Get, url))
                 : await _httpClient.GetAsync(url);
 
-            if (!response.IsSuccessStatusCode) return ([], 0);
+            if (!response.IsSuccessStatusCode)
+            {
+                sw.Stop();
+                if (sw.ElapsedMilliseconds >= SlowReadThresholdMs)
+                    Console.WriteLine($"\n  [slow-read] {sw.ElapsedMilliseconds}ms {(int)response.StatusCode} {ShortenUrl(url)}");
+                return ([], 0);
+            }
 
             var totalPages = 1;
             if (response.Headers.TryGetValues("X-WP-TotalPages", out var values) &&
@@ -335,11 +483,17 @@ public partial class WpMigrator
                 totalPages = tp;
 
             var json = await response.Content.ReadAsStringAsync();
+            sw.Stop();
+            if (sw.ElapsedMilliseconds >= SlowReadThresholdMs)
+                Console.WriteLine($"\n  [slow-read] {sw.ElapsedMilliseconds}ms {(int)response.StatusCode} {json.Length}B {ShortenUrl(url)}");
+
             var items = JsonConvert.DeserializeObject<List<T>>(json) ?? [];
             return (items, totalPages);
         }
-        catch
+        catch (Exception ex)
         {
+            sw.Stop();
+            Console.WriteLine($"\n  [read-fail] {sw.ElapsedMilliseconds}ms {ex.GetType().Name} {ShortenUrl(url)}: {ex.Message}");
             return ([], 0);
         }
     }
@@ -393,6 +547,29 @@ public partial class WpMigrator
             .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
     }
 
+    // Keys can collide on slug: WP rejects same-slug create but historical
+    // dirty data (manual edits, failed migration retries, dedupe gaps) can
+    // leave two posts sharing a slug. First-wins + warn so the caller sees
+    // which slugs are dup without crashing the run.
+    private static Dictionary<string, T> BuildBySlug<T>(IEnumerable<T> items, Func<T, string?> getSlug, string label)
+    {
+        var dict = new Dictionary<string, T>(StringComparer.Ordinal);
+        var dups = new List<string>();
+        foreach (var item in items)
+        {
+            var slug = getSlug(item);
+            if (string.IsNullOrEmpty(slug)) continue;
+            if (!dict.TryAdd(slug, item)) dups.Add(slug);
+        }
+        if (dups.Count > 0)
+        {
+            var sample = string.Join(", ", dups.Distinct().Take(5));
+            var more = dups.Distinct().Count() > 5 ? "…" : "";
+            Console.WriteLine($"    Warning: {dups.Count} duplicate slug(s) in {label}, kept first: {sample}{more}");
+        }
+        return dict;
+    }
+
     private void BuildBackupFileIndex()
     {
         var postsDir = Path.Combine(_backupRoot, "posts");
@@ -416,9 +593,7 @@ public partial class WpMigrator
 
         // Match source-domain media URLs across both http and https (legacy posts may
         // still embed http URLs even when current site is https-only).
-        var pattern = @"https?://" + Regex.Escape(_config.SourceDomain) + @"/wp-content/uploads/[^\s""'<>\)]+";
-
-        return Regex.Replace(content, pattern, match =>
+        return _contentUrlRegex.Replace(content, match =>
         {
             var sourceUrl = match.Value;
             try
@@ -448,6 +623,21 @@ public partial class WpMigrator
 
             return sourceUrl;
         });
+    }
+
+    /// <summary>
+    /// True if content has at least one source-domain media URL that is NOT known-dead —
+    /// i.e. something this run could still upload and rewrite. Returns false when the only
+    /// remaining source URLs are permanent link rot (cached in _deadSourceMedia), so such
+    /// posts can be marked verified instead of re-examined (and re-pushed) every run.
+    /// </summary>
+    private bool HasFixableSourceMedia(string content)
+    {
+        if (string.IsNullOrEmpty(content)) return false;
+        foreach (Match m in _contentUrlRegex.Matches(content))
+            if (!_deadSourceMedia.ContainsKey(DeadMediaKey(m.Value)))
+                return true;
+        return false;
     }
 
     private void TrackTargetMedia(MediaItem media)

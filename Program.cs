@@ -32,19 +32,26 @@ while (true)
     Console.WriteLine("  Commands:");
     PrintCommand("migrate",      "Sync source → backup → target (idempotent)");
     PrintCommand("audit",        "Diagnostics: cyrillic slugs + extra posts + broken media");
-    PrintCommand("fix-content",  "Strip srcset, repair broken URLs, rewrite size variants");
+    PrintCommand("fix-content",  "Run all content fix passes (galleries, srcset, links, media, variants)");
+    PrintCommand("fix-galleries","Replace broken Newspaper td-gallery sliders with WP gallery blocks");
+    PrintCommand("test-gallery", "Run fix-galleries on the FIRST matching post only, with confirm");
+    PrintCommand("unwrap-links", "Remove broken <a href> wrappers around images");
     PrintCommand("relink",       "Fix internal post links with stale post-id suffixes");
     PrintCommand("dedupe-media", "Merge duplicate media uploads");
     PrintCommand("finalize",     "Rewrite media URLs from target domain to canonical");
     PrintCommand("status",       "Compare source vs target, show progress");
+    PrintCommand("hit-post",     "Time a noop update on one post (debug WP hangs): hit-post <slug>");
     PrintCommand("setup",        "Configure source/target WordPress sites");
     PrintCommand("exit",         "Exit the application");
     Console.WriteLine();
 
     Console.Write("  > ");
-    var input = Console.ReadLine()?.Trim().ToLowerInvariant();
+    var raw = Console.ReadLine()?.Trim();
+    if (string.IsNullOrEmpty(raw)) continue;
 
-    if (string.IsNullOrEmpty(input)) continue;
+    var spaceIdx = raw.IndexOf(' ');
+    var input = (spaceIdx < 0 ? raw : raw[..spaceIdx]).ToLowerInvariant();
+    var argTail = spaceIdx < 0 ? "" : raw[(spaceIdx + 1)..].Trim();
 
     if (input is "exit" or "quit" or "q")
     {
@@ -65,6 +72,15 @@ while (true)
             case "fix-content":
                 await migrator.FixContent();
                 break;
+            case "fix-galleries":
+                await migrator.FixGalleries();
+                break;
+            case "test-gallery":
+                await migrator.FixGalleries(testOne: true);
+                break;
+            case "unwrap-links":
+                await migrator.UnwrapBrokenImageLinks();
+                break;
             case "relink":
                 await migrator.Relink();
                 break;
@@ -76,6 +92,14 @@ while (true)
                 break;
             case "status":
                 await migrator.Status();
+                break;
+            case "hit-post":
+                if (string.IsNullOrEmpty(argTail))
+                {
+                    Console.WriteLine("  Usage: hit-post <slug>");
+                    break;
+                }
+                await migrator.HitPost(argTail);
                 break;
             case "setup":
                 config = SiteConfig.RunSetup();
