@@ -162,7 +162,7 @@ public partial class WpMigrator
         }
 
         Merge(firstPage);
-        var width = Math.Max(Console.WindowWidth, 80);
+        var width = Term.Width;
         Console.Write($"\r  Fetching target content: page 1/{totalPages}".PadRight(width - 1));
 
         if (totalPages > 1)

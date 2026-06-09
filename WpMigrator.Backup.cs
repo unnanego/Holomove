@@ -54,10 +54,10 @@ public partial class WpMigrator
         // URLs (e.g. [video src=…] → <video src=…>) get backed up too. Raw
         // extraction was leaving those URLs out of the backup folder, so the
         // upload step had to rely on the live-source fallback every time.
+        // CollectSourceMediaUrls (not bare ExtractMediaUrls) so <a href> full-size
+        // images, srcset and CSS URLs are backed up too — same set the uploader needs.
         var processed = CleanupHtml(ProcessShortcodes(post.Content.Rendered));
-        var mediaUrls = ExtractMediaUrls(processed)
-            .Where(IsSourceMedia)
-            .ToList();
+        var mediaUrls = CollectSourceMediaUrls(processed);
 
         // Get featured media URL — prefer in-memory index (no extra API call)
         string? featuredUrl = null;
@@ -294,9 +294,14 @@ public partial class WpMigrator
 
     private async Task SaveTargetPostCache()
     {
+        // Use the API field names (snake_case) so the cache round-trips through the WpPost
+        // model on load. Serializing as "FeaturedMedia" wrote a key that WpPost's
+        // [JsonProperty("featured_media")] can't bind, so every cached post loaded back with
+        // FeaturedMedia==0 — feeding the spurious needsFeaturedRecheck that re-touched all posts.
         var cache = _targetPosts.Where(p => p.Id > 0).Select(p => new
         {
-            p.Id, p.Slug, p.Author, p.Tags, p.Categories, p.FeaturedMedia
+            id = p.Id, slug = p.Slug, author = p.Author,
+            tags = p.Tags, categories = p.Categories, featured_media = p.FeaturedMedia
         }).ToList();
         await File.WriteAllTextAsync(
             Path.Combine(_backupRoot, "target-cache.json"),

@@ -25,6 +25,52 @@ void PrintCommand(string name, string desc)
     Console.WriteLine(desc);
 }
 
+// Dispatch a single command. Returns false if unrecognized.
+async Task<bool> RunCommand(string command, string argTail)
+{
+    switch (command)
+    {
+        case "migrate": await migrator.Migrate(); return true;
+        case "audit": await migrator.RunAudit(); return true;
+        case "fix-content": await migrator.FixContent(); return true;
+        case "fix-galleries": await migrator.FixGalleries(); return true;
+        case "test-gallery": await migrator.FixGalleries(testOne: true); return true;
+        case "unwrap-links": await migrator.UnwrapBrokenImageLinks(); return true;
+        case "relink": await migrator.Relink(); return true;
+        case "dedupe-media": await migrator.DedupeMedia(); return true;
+        case "finalize": await migrator.FinalizeUrls(); return true;
+        case "status": await migrator.Status(); return true;
+        case "hit-post":
+            if (string.IsNullOrEmpty(argTail)) Console.WriteLine("  Usage: hit-post <slug>");
+            else await migrator.HitPost(argTail);
+            return true;
+        case "setup":
+            config = SiteConfig.RunSetup();
+            migrator = new WpMigrator(config);
+            await migrator.Init();
+            return true;
+        default: return false;
+    }
+}
+
+// Headless mode: `Holomove <command> [args]` runs one command and exits (each command
+// flushes its own caches on completion). Lets a long migrate run unattended / in background.
+if (args.Length > 0)
+{
+    var headlessCmd = args[0].ToLowerInvariant();
+    var headlessTail = args.Length > 1 ? string.Join(' ', args[1..]) : "";
+    try
+    {
+        if (!await RunCommand(headlessCmd, headlessTail))
+            Console.WriteLine($"  Unknown command: {headlessCmd}");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"\n  Error: {ex.Message}");
+    }
+    return;
+}
+
 while (true)
 {
     Console.WriteLine();
@@ -61,56 +107,11 @@ while (true)
 
     try
     {
-        switch (input)
+        if (!await RunCommand(input, argTail))
         {
-            case "migrate":
-                await migrator.Migrate();
-                break;
-            case "audit":
-                await migrator.RunAudit();
-                break;
-            case "fix-content":
-                await migrator.FixContent();
-                break;
-            case "fix-galleries":
-                await migrator.FixGalleries();
-                break;
-            case "test-gallery":
-                await migrator.FixGalleries(testOne: true);
-                break;
-            case "unwrap-links":
-                await migrator.UnwrapBrokenImageLinks();
-                break;
-            case "relink":
-                await migrator.Relink();
-                break;
-            case "dedupe-media":
-                await migrator.DedupeMedia();
-                break;
-            case "finalize":
-                await migrator.FinalizeUrls();
-                break;
-            case "status":
-                await migrator.Status();
-                break;
-            case "hit-post":
-                if (string.IsNullOrEmpty(argTail))
-                {
-                    Console.WriteLine("  Usage: hit-post <slug>");
-                    break;
-                }
-                await migrator.HitPost(argTail);
-                break;
-            case "setup":
-                config = SiteConfig.RunSetup();
-                migrator = new WpMigrator(config);
-                await migrator.Init();
-                break;
-            default:
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"  Unknown command: {input}");
-                Console.ResetColor();
-                break;
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"  Unknown command: {input}");
+            Console.ResetColor();
         }
     }
     catch (Exception ex)

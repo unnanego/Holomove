@@ -133,12 +133,27 @@ public partial class WpMigrator
     /// </summary>
     private async Task<List<int>> UploadAllPostMedia(string content, int? attachToPostId = null, string? postLink = null)
     {
-        var mediaUrls = ExtractMediaUrls(content).Where(IsSourceMedia).ToList();
+        // Cover the same URL set RewriteContentUrls/HasFixableSourceMedia operate on, not just
+        // <img>/<video> src + doc links — otherwise <a href> full-size images, srcset and CSS
+        // URLs are never uploaded nor marked dead, and their posts loop forever (see
+        // CollectSourceMediaUrls).
+        var mediaUrls = CollectSourceMediaUrls(content);
         if (mediaUrls.Count == 0) return [];
+
+        // Collapse to ONE upload per base file. A single responsive image yields the <img src>
+        // variant, the <a href> full-size and 4-6 srcset candidates — all of which UploadMedia
+        // strips to the same base. Without this, an image-heavy post fires 6-8 UploadMedia calls
+        // per image, and every call after the first hits the existing-media branch; that
+        // redundant traffic was the bulk of the catch-up cost. DeadMediaKey is the same base
+        // key UploadMedia and the rewrite use, so deduping on it is consistent.
+        var baseUrls = mediaUrls
+            .GroupBy(DeadMediaKey, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.First())
+            .ToList();
 
         var uploadedIds = new System.Collections.Concurrent.ConcurrentBag<int>();
 
-        await Parallel.ForEachAsync(mediaUrls, new ParallelOptions { MaxDegreeOfParallelism = 3 },
+        await Parallel.ForEachAsync(baseUrls, new ParallelOptions { MaxDegreeOfParallelism = 3 },
             async (url, _) =>
             {
                 var uploaded = await UploadMedia(url, attachToPostId, postLink);
@@ -151,6 +166,12 @@ public partial class WpMigrator
 
     private bool IsSourceMedia(string url)
     {
+        // Host-exact: the target domain can be a subdomain of the source (e.g.
+        // new.holographica.space ⊃ holographica.space), so a substring test would treat
+        // already-migrated target media as source and trigger needless re-upload/attach.
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            return uri.Host.Equals(_config.SourceDomain, StringComparison.OrdinalIgnoreCase);
+        // Relative/protocol-relative/malformed → fall back to the substring heuristic.
         return url.Contains(_config.SourceWpUrl) || url.Contains($"{_config.SourceDomain}/wp-content/uploads");
     }
 
@@ -239,11 +260,12 @@ public partial class WpMigrator
                 existingMedia = byBaseSanitized;
 
             if (existingMedia != null)
-            {
-                if (attachToPostId.HasValue && existingMedia.Id > 0)
-                    await AttachMediaToPost(existingMedia.Id, attachToPostId.Value);
+                // Already on target — don't re-attach. Attachment (media.post parent) is
+                // cosmetic for migration; the post body references media by URL. Re-attaching
+                // every already-present image is a serialized write per image per run that
+                // dominated catch-up time and gains nothing. New uploads below still attach
+                // via the ?post= upload param.
                 return existingMedia;
-            }
 
             // For size variants, upload the BASE file instead of the variant —
             // WP regenerates variants on demand from the base. Uploading the
@@ -458,6 +480,37 @@ public partial class WpMigrator
 
         foreach (Match m in DocumentLinkRegex().Matches(content))
             urls.Add(m.Groups[1].Value);
+
+        return urls.ToList();
+    }
+
+    /// <summary>
+    /// Every source-domain media URL the rewrite step can touch — the union of HTML
+    /// media tags (img/video/source src + document links via <see cref="ExtractMediaUrls"/>)
+    /// and EVERY source /wp-content/uploads URL found anywhere in the body via
+    /// _contentUrlRegex: linked full-size images in &lt;a href&gt;, srcset candidates,
+    /// CSS url(...), bare text URLs, etc.
+    ///
+    /// RewriteContentUrls and HasFixableSourceMedia both key off _contentUrlRegex, so the
+    /// uploader MUST cover the same set. When it didn't, a URL the rewrite wanted to fix was
+    /// never uploaded (so never landed on target → rewrite couldn't resolve it) AND never ran
+    /// through UploadMedia (so was never recorded in _deadSourceMedia). The post therefore
+    /// stayed permanently "unresolved": skipped by the verified-cache fast path, re-examined
+    /// and content re-pushed on EVERY run — the reason incremental migrate reprocessed
+    /// ~1.2k already-migrated posts each time and ran for days. ExtractMediaUrls alone was
+    /// catching ~4.7k of ~13.2k source URLs in those posts; the other ~8.5k (mostly &lt;a href&gt;
+    /// full-size images, srcset, CSS) fell through this gap.
+    /// </summary>
+    private List<string> CollectSourceMediaUrls(string content)
+    {
+        if (string.IsNullOrEmpty(content)) return [];
+
+        var urls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var url in ExtractMediaUrls(content))
+            if (IsSourceMedia(url)) urls.Add(url);
+        // _contentUrlRegex matches source-domain /wp-content/uploads URLs by construction.
+        foreach (Match m in _contentUrlRegex.Matches(content))
+            urls.Add(m.Value);
 
         return urls.ToList();
     }

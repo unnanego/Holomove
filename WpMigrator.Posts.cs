@@ -270,10 +270,15 @@ public partial class WpMigrator
                 var count = Interlocked.Increment(ref done);
                 progress.Update(count, total, sourcePost.Slug);
 
-                // Flush verified cache periodically so a mid-run hang preserves progress.
+                // Flush verified + dead-media caches periodically so a mid-run crash/kill
+                // preserves progress. Dead-media (the link-rot live-fetch results) is otherwise
+                // only saved at run end / Ctrl-C; a hard kill would re-probe every dead URL next
+                // run. Both files are small; target-media-cache is left to end/cancel (it's 30MB+
+                // and on a Google-Drive-synced path, and uploaded media is re-discoverable via
+                // DownloadTargetMediaList anyway).
                 if (count % 100 == 0)
                 {
-                    try { SaveVerifiedPostsCache(); } catch { /* best effort */ }
+                    try { SaveVerifiedPostsCache(); SaveDeadSourceMediaCache(); } catch { /* best effort */ }
                 }
             });
 
@@ -630,16 +635,22 @@ public partial class WpMigrator
     private async Task FetchPostsInBulk(string apiUrl, List<WpPost> targetList, bool useAuth = false,
         string? fields = null)
     {
-        var existingIds = targetList.Where(p => p.Id > 0).Select(p => p.Id).ToHashSet();
-        // Build slug→index map for stub posts (Id==0) so we can replace them in O(1)
+        // Index existing real-Id posts by Id so a fresh fetch REFRESHES them in place.
+        // The old code skipped already-known Ids, which froze mutable fields (featured_media,
+        // tags, categories, author, status) at whatever they were when the post was first
+        // cached. For target that meant cached featured_media stayed 0 forever even after the
+        // image was set live — so needsFeaturedRecheck fired for every post on every run and
+        // the verified-cache fast path was never taken, making incremental migrate re-touch
+        // nearly every post. Stub posts (Id==0, from backup) are still replaced by slug.
+        var indexById = new Dictionary<int, int>();
         var stubsBySlug = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         for (var idx = 0; idx < targetList.Count; idx++)
         {
-            if (targetList[idx].Id == 0)
-                stubsBySlug.TryAdd(targetList[idx].Slug, idx);
+            if (targetList[idx].Id > 0) indexById[targetList[idx].Id] = idx;
+            else stubsBySlug.TryAdd(targetList[idx].Slug, idx);
         }
 
-        var width = Math.Max(Console.WindowWidth, 80);
+        var width = Term.Width;
         var extraQuery = string.IsNullOrEmpty(fields) ? null : $"_fields={fields}";
 
         var (firstPage, totalPages) = await FetchPageAsync<WpPost>(apiUrl, "posts", 1, useAuth, extraQuery);
@@ -653,17 +664,24 @@ public partial class WpMigrator
             {
                 foreach (var post in posts)
                 {
-                    if (existingIds.Contains(post.Id)) continue;
+                    // Already known by Id → overwrite in place so live values (featured_media,
+                    // tags, …) replace the stale cached ones. Not counted as "new".
+                    if (indexById.TryGetValue(post.Id, out var existingIdx))
+                    {
+                        targetList[existingIdx] = post;
+                        continue;
+                    }
                     if (stubsBySlug.TryGetValue(post.Slug, out var stubIndex))
                     {
                         targetList[stubIndex] = post;
                         stubsBySlug.Remove(post.Slug);
+                        indexById[post.Id] = stubIndex;
                     }
                     else
                     {
                         targetList.Add(post);
+                        indexById[post.Id] = targetList.Count - 1;
                     }
-                    existingIds.Add(post.Id);
                     fetched++;
                 }
             }

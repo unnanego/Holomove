@@ -57,7 +57,8 @@
       "PowerShell($b=Get-Content bin/Debug/net9.0/settings.json -Raw|ConvertFrom-Json; \"len=$\\($b.TargetPassword.Length\\) user=$\\($b.TargetUsername\\) src=$\\($b.SourceDomain\\) tgt=$\\($b.TargetDomain\\)\"; \"hex: $\\(\\(\\($b.TargetPassword.ToCharArray\\(\\)|ForEach-Object {[int]$_}\\) -join ','\\)\\)\")",
       "PowerShell(pip *)",
       "Bash(dotnet restore *)",
-      "PowerShell(dotnet build *)"
+      "PowerShell(dotnet build *)",
+      "Bash(git *)"
     ],
     "deny": [],
     "ask": []

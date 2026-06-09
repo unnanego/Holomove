@@ -1,5 +1,16 @@
 namespace Holomove;
 
+internal static class Term
+{
+    // Console.WindowWidth throws IOException ("The handle is invalid") when output is
+    // redirected (headless / piped / background run). Fall back to a fixed width so the
+    // app runs without a real console attached.
+    public static int Width
+    {
+        get { try { return Math.Max(Console.WindowWidth, 80); } catch { return 120; } }
+    }
+}
+
 public class ProgressBar
 {
     private readonly int _barWidth;
@@ -25,13 +36,13 @@ public class ProgressBar
         var line = $"\r  [{bar}] {percent,5:F1}% {counter}{text}";
 
         // Pad to terminal width to clear previous longer lines
-        var width = Math.Max(Console.WindowWidth, 80);
+        var width = Term.Width;
         Console.Write(line.PadRight(width - 1));
     }
 
     public void Complete(string? message = null)
     {
-        var width = Math.Max(Console.WindowWidth, 80);
+        var width = Term.Width;
         if (message != null)
         {
             Console.Write($"\r  {message}".PadRight(width - 1));
