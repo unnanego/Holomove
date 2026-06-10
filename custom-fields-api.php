@@ -29,29 +29,15 @@ function get_custom_meta( $post ) {
 }
 
 function update_custom_meta($data, $post, $field_name) {
-    write_log("\n______________________________________________________________________________\n");
     foreach ($data as $key => $value) {
-        $val = $value[0];
         if ($key === "_thumbnail_id" && !is_array($value)) {
-            write_log("Updating _thumbnail_id of post with id " . $post->ID . " with " . $value);
             update_post_meta($post->ID, $key, $value);
             continue;
         }
-        
-        if (unserialize($val) != false) {
-            $val = unserialize($val);
-        }
 
-        update_post_meta($post->ID, $key, $val);
+        $val = is_array($value) ? $value[0] : $value;
+        update_post_meta($post->ID, $key, maybe_unserialize($val));
     }
 
     return;
-}
-
-function write_log ( $log )  {
-    if ( is_array( $log ) || is_object( $log ) ) {
-        error_log( print_r( $log, true ) );
-    } else {
-        error_log( $log );
-    }
 }

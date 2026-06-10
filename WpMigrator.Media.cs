@@ -343,6 +343,12 @@ public partial class WpMigrator
                 uploadUrl += $"?post={attachToPostId.Value}";
 
             var request = CreateAuthenticatedRequest(HttpMethod.Post, uploadUrl);
+            // Never blind-retry an upload: WP saves the file (and attachment row) BEFORE
+            // the slow thumbnail-generation phase where timeouts/500s occur, so a retry
+            // after such a failure duplicates the file (file-1.jpg, -2…) plus its whole
+            // thumbnail set. That duplication is what filled the target disk. On failure
+            // we instead probe whether the upload landed (below).
+            request.Options.Set(RetryHandler.NoRetry, true);
 
             using var uploadContent = new ByteArrayContent(mediaBytes);
             uploadContent.Headers.ContentType = new MediaTypeHeaderValue(GetMimeType(fileName));
@@ -352,12 +358,27 @@ public partial class WpMigrator
             };
             request.Content = uploadContent;
 
-            var response = await SendWriteAsync(uploadUrl, mediaBytes.Length, () => _httpClient.SendAsync(request));
-            var json = await response.Content.ReadAsStringAsync();
-
-            if (!response.IsSuccessStatusCode)
+            HttpResponseMessage? response = null;
+            var json = "";
+            Exception? sendError = null;
+            try
             {
-                _uploadErrors.Add($"{fileName}: HTTP {(int)response.StatusCode} — {Truncate(json, 200)}{FormatPostLink(postLink)}");
+                response = await SendWriteAsync(uploadUrl, mediaBytes.Length, () => _httpClient.SendAsync(request));
+                json = await response.Content.ReadAsStringAsync();
+            }
+            catch (Exception ex)
+            {
+                sendError = ex;
+            }
+
+            if (response is not { IsSuccessStatusCode: true })
+            {
+                var landed = await FindLandedUpload(fileName);
+                if (landed != null) return landed;
+
+                _uploadErrors.Add(sendError != null
+                    ? $"{fileName}: {sendError.GetType().Name}: {sendError.Message}{FormatPostLink(postLink)}"
+                    : $"{fileName}: HTTP {(int)response!.StatusCode} — {Truncate(json, 200)}{FormatPostLink(postLink)}");
                 return null;
             }
 
@@ -370,6 +391,40 @@ public partial class WpMigrator
             _uploadErrors.Add($"{sourceUrl}: {ex.Message}{FormatPostLink(postLink)}");
             return null;
         }
+    }
+
+    /// <summary>
+    /// After a failed upload response (timeout / 5xx / connection drop), checks whether
+    /// the file actually landed on target anyway. wp_insert_attachment commits before the
+    /// thumbnail-generation phase where slow servers blow up, so "failed" uploads very
+    /// often exist. Finding them here prevents the duplicate re-upload on the next call/run.
+    /// </summary>
+    private async Task<MediaItem?> FindLandedUpload(string fileName)
+    {
+        try
+        {
+            // Give a still-grinding server a moment to commit the attachment row.
+            await Task.Delay(3000);
+
+            var search = Uri.EscapeDataString(Path.GetFileNameWithoutExtension(fileName));
+            var url = $"{_config.TargetWpApiUrl}wp/v2/media?search={search}&per_page=20&_fields=id,source_url";
+            var response = await _httpClient.SendAsync(CreateAuthenticatedRequest(HttpMethod.Get, url));
+            if (!response.IsSuccessStatusCode) return null;
+
+            var items = JsonConvert.DeserializeObject<List<MediaItem>>(await response.Content.ReadAsStringAsync()) ?? [];
+            foreach (var item in items)
+            {
+                if (string.IsNullOrEmpty(item.SourceUrl)) continue;
+                var landedName = Path.GetFileName(new Uri(item.SourceUrl).LocalPath);
+                if (landedName.Equals(fileName, StringComparison.OrdinalIgnoreCase))
+                {
+                    TrackTargetMedia(item);
+                    return item;
+                }
+            }
+        }
+        catch { /* treat as not landed */ }
+        return null;
     }
 
     private static string Truncate(string s, int max) =>

@@ -393,12 +393,13 @@ public partial class WpMigrator
         return request;
     }
 
-    private async Task<HttpResponseMessage> PostJsonAsync(string url, object payload)
+    private async Task<HttpResponseMessage> PostJsonAsync(string url, object payload, bool noRetry = false)
     {
         var json = JsonConvert.SerializeObject(payload);
         return await SendWriteAsync(url, json.Length, () =>
         {
             var request = CreateAuthenticatedRequest(HttpMethod.Post, url);
+            if (noRetry) request.Options.Set(RetryHandler.NoRetry, true);
             request.Content = new StringContent(json, Encoding.UTF8, "application/json");
             return _httpClient.SendAsync(request);
         });
@@ -527,7 +528,10 @@ public partial class WpMigrator
     {
         try
         {
-            var response = await PostJsonAsync($"{_config.TargetWpApiUrl}wp/v2/{endpoint}", payload);
+            // noRetry: a create whose response times out may still have committed on the
+            // server — retrying it mints a duplicate (ghost posts with "-2" slugs, dup
+            // tags). A genuinely failed create is recovered next run via slug matching.
+            var response = await PostJsonAsync($"{_config.TargetWpApiUrl}wp/v2/{endpoint}", payload, noRetry: true);
             var json = await response.Content.ReadAsStringAsync();
             return response.IsSuccessStatusCode ? JsonConvert.DeserializeObject<T>(json) : null;
         }

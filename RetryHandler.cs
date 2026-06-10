@@ -8,6 +8,15 @@ public class RetryHandler(HttpMessageHandler innerHandler) : DelegatingHandler(i
     public int MaxRetries { get; init; } = 3;
 
     /// <summary>
+    /// Marks a request as non-idempotent (e.g. media upload, post create): a timeout or
+    /// 5xx after the server already did the work would duplicate it on retry. Such
+    /// requests are sent once; only the 401 re-auth retry remains (the server rejects
+    /// those before doing any work). Callers recover by checking whether the write
+    /// actually landed.
+    /// </summary>
+    public static readonly HttpRequestOptionsKey<bool> NoRetry = new("Holomove.NoRetry");
+
+    /// <summary>
     /// Invoked on 401 Unauthorized. Returns a fresh bearer token, or null to skip.
     /// Called at most once per request (across all retries).
     /// </summary>
@@ -18,6 +27,7 @@ public class RetryHandler(HttpMessageHandler innerHandler) : DelegatingHandler(i
         HttpResponseMessage? response = null;
         var currentToken = request.Headers.Authorization?.Parameter;
         var didReauth = false;
+        request.Options.TryGetValue(NoRetry, out var noRetry);
 
         for (var i = 0; i <= MaxRetries; i++)
         {
@@ -46,21 +56,22 @@ public class RetryHandler(HttpMessageHandler innerHandler) : DelegatingHandler(i
 
                 if (response.IsSuccessStatusCode
                     || (int)response.StatusCode < 500 && response.StatusCode != HttpStatusCode.TooManyRequests
-                    || i >= MaxRetries) return response;
+                    || i >= MaxRetries
+                    || noRetry) return response;
 
                 var delay = response.StatusCode is HttpStatusCode.GatewayTimeout or HttpStatusCode.ServiceUnavailable
                     ? (i + 1) * 10000   // 10/20/30s for server overload
                     : (i + 1) * 2000;
                 await Task.Delay(delay, cancellationToken);
             }
-            catch (HttpRequestException) when (i < MaxRetries)
+            catch (HttpRequestException) when (i < MaxRetries && !noRetry)
             {
                 var delay = (i + 1) * 2000;
                 await Task.Delay(delay, cancellationToken);
             }
             // TaskCanceledException without caller cancellation = HttpClient.Timeout fired.
             // Treat as transient (server hung) and retry. Caller cancellation re-throws.
-            catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested && i < MaxRetries)
+            catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested && i < MaxRetries && !noRetry)
             {
                 var delay = (i + 1) * 5000;
                 await Task.Delay(delay, cancellationToken);
