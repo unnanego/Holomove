@@ -61,7 +61,9 @@ public class MediaItem
 {
     [JsonProperty("id")] public int Id { get; set; }
     [JsonProperty("source_url")] public string SourceUrl { get; set; } = "";
-    [JsonProperty("post")] public int Post { get; set; }
+    // WP returns null for unattached media — treat as 0 (the "unattached" sentinel
+    // the dedupe logic already uses) instead of failing the whole page deserialize.
+    [JsonProperty("post", NullValueHandling = NullValueHandling.Ignore)] public int Post { get; set; }
     [JsonProperty("media_details")] public MediaDetails? MediaDetails { get; set; }
 }
 
