@@ -463,39 +463,62 @@ public partial class WpMigrator
         var url = $"{apiUrl}wp/v2/{endpoint}?per_page=100&page={page}";
         if (!string.IsNullOrEmpty(extraQuery)) url += $"&{extraQuery}";
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        try
+        // Reads are idempotent GETs, so retry transient failures (5xx / timeout) instead of
+        // silently returning ([], 0). On this slow target a single dropped page meant ~100
+        // media items never entered the in-memory index, so their content URLs could never
+        // be rewritten — the post stayed "unresolved" and was re-pushed on every run (the
+        // main reason already-migrated posts never converged). 4xx is terminal (e.g. a page
+        // past the real last page), so it isn't retried.
+        const int maxAttempts = 3;
+        for (var attempt = 1; ; attempt++)
         {
-            var response = useAuth
-                ? await _httpClient.SendAsync(CreateAuthenticatedRequest(HttpMethod.Get, url))
-                : await _httpClient.GetAsync(url);
-
-            if (!response.IsSuccessStatusCode)
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try
             {
+                var response = useAuth
+                    ? await _httpClient.SendAsync(CreateAuthenticatedRequest(HttpMethod.Get, url))
+                    : await _httpClient.GetAsync(url);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    sw.Stop();
+                    var code = (int)response.StatusCode;
+                    if (code >= 500 && attempt < maxAttempts)
+                    {
+                        Console.WriteLine($"\n  [read-retry {attempt}/{maxAttempts}] {code} {ShortenUrl(url)}");
+                        await Task.Delay(attempt * 1000);
+                        continue;
+                    }
+                    if (sw.ElapsedMilliseconds >= SlowReadThresholdMs || code >= 500)
+                        Console.WriteLine($"\n  [slow-read] {sw.ElapsedMilliseconds}ms {code} {ShortenUrl(url)}");
+                    return ([], 0);
+                }
+
+                var totalPages = 1;
+                if (response.Headers.TryGetValues("X-WP-TotalPages", out var values) &&
+                    int.TryParse(values.FirstOrDefault(), out var tp))
+                    totalPages = tp;
+
+                var json = await response.Content.ReadAsStringAsync();
                 sw.Stop();
                 if (sw.ElapsedMilliseconds >= SlowReadThresholdMs)
-                    Console.WriteLine($"\n  [slow-read] {sw.ElapsedMilliseconds}ms {(int)response.StatusCode} {ShortenUrl(url)}");
+                    Console.WriteLine($"\n  [slow-read] {sw.ElapsedMilliseconds}ms {(int)response.StatusCode} {json.Length}B {ShortenUrl(url)}");
+
+                var items = JsonConvert.DeserializeObject<List<T>>(json) ?? [];
+                return (items, totalPages);
+            }
+            catch (Exception ex)
+            {
+                sw.Stop();
+                if (attempt < maxAttempts)
+                {
+                    Console.WriteLine($"\n  [read-retry {attempt}/{maxAttempts}] {ex.GetType().Name} {ShortenUrl(url)}");
+                    await Task.Delay(attempt * 1000);
+                    continue;
+                }
+                Console.WriteLine($"\n  [read-fail] {sw.ElapsedMilliseconds}ms {ex.GetType().Name} {ShortenUrl(url)}: {ex.Message}");
                 return ([], 0);
             }
-
-            var totalPages = 1;
-            if (response.Headers.TryGetValues("X-WP-TotalPages", out var values) &&
-                int.TryParse(values.FirstOrDefault(), out var tp))
-                totalPages = tp;
-
-            var json = await response.Content.ReadAsStringAsync();
-            sw.Stop();
-            if (sw.ElapsedMilliseconds >= SlowReadThresholdMs)
-                Console.WriteLine($"\n  [slow-read] {sw.ElapsedMilliseconds}ms {(int)response.StatusCode} {json.Length}B {ShortenUrl(url)}");
-
-            var items = JsonConvert.DeserializeObject<List<T>>(json) ?? [];
-            return (items, totalPages);
-        }
-        catch (Exception ex)
-        {
-            sw.Stop();
-            Console.WriteLine($"\n  [read-fail] {sw.ElapsedMilliseconds}ms {ex.GetType().Name} {ShortenUrl(url)}: {ex.Message}");
-            return ([], 0);
         }
     }
 
@@ -543,12 +566,43 @@ public partial class WpMigrator
         _sourceTagsDict = _sourceTags.ToDictionary(t => t.Id);
         _sourceUsersDict = _sourceAuthors.ToDictionary(u => u.Id);
         _sourceCategoriesDict = _sourceCategories.ToDictionary(c => c.Id);
-        _targetTagsDict = _targetTags.ToDictionary(t => t.Slug);
-        _targetCategoriesDict = _targetCategories.ToDictionary(c => c.Slug);
+
+        // Slug keys must survive percent-encoding differences between installs: a target
+        // slug can be stored URL-encoded ("%d0%b2%d1%80") while the matching source slug is
+        // the decoded form ("вр"). Keying by the raw slug made every Cyrillic-tagged post
+        // mismatch and re-push its tags/categories on every run (and never converge).
+        // SlugComparer normalizes both sides via Uri.UnescapeDataString. Last-wins loop
+        // (not ToDictionary) so two raw slugs that normalize to the same key don't throw.
+        _targetTagsDict = new Dictionary<string, WpTag>(SlugComparer.Instance);
+        foreach (var t in _targetTags) _targetTagsDict[t.Slug] = t;
+        _targetCategoriesDict = new Dictionary<string, WpCategory>(SlugComparer.Instance);
+        foreach (var c in _targetCategories) _targetCategoriesDict[c.Slug] = c;
+
         _targetAuthorsBySlug = _targetAuthors.ToDictionary(a => a.Slug, StringComparer.OrdinalIgnoreCase);
         _targetAuthorsByName = _targetAuthors
             .GroupBy(a => a.Name, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Equality over WP slugs that ignores percent-encoding and case, so a decoded
+    /// source slug ("вр") matches a URL-encoded target slug ("%d0%b2%d1%80"). Used to
+    /// key the target tag/category lookups; without it, non-ASCII taxonomy never matched
+    /// and posts were re-pushed forever.
+    /// </summary>
+    private sealed class SlugComparer : IEqualityComparer<string>
+    {
+        public static readonly SlugComparer Instance = new();
+
+        private static string Norm(string? s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            try { return Uri.UnescapeDataString(s).ToLowerInvariant(); }
+            catch { return s.ToLowerInvariant(); }
+        }
+
+        public bool Equals(string? a, string? b) => Norm(a) == Norm(b);
+        public int GetHashCode(string s) => Norm(s).GetHashCode();
     }
 
     // Keys can collide on slug: WP rejects same-slug create but historical
