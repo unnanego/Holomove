@@ -58,7 +58,12 @@
       "PowerShell(pip *)",
       "Bash(dotnet restore *)",
       "PowerShell(dotnet build *)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(command -v sshpass)",
+      "Bash(command -v ssh)",
+      "Bash(command -v plink)",
+      "Bash(command -v putty)",
+      "Bash(ssh -V)"
     ],
     "deny": [],
     "ask": []
